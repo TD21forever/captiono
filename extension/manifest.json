@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "Captiono",
+  "version": "1.6.0",
+  "description": "从 YouTube 和 Bilibili 视频里拾取表达、批注字幕并导出学习记录。",
+  "minimum_chrome_version": "139",
+  "permissions": [
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://*.youtube.com/*",
+    "https://www.bilibili.com/*",
+    "https://api.bilibili.com/*",
+    "https://*.hdslb.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "显示或隐藏 Captiono",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.youtube.com/*",
+        "https://www.bilibili.com/*"
+      ],
+      "js": [
+        "content-script.js",
+        "caption-review-ui.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

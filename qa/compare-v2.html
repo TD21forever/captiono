@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Captiono · Visual comparison v2</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: #c6c9cc;
+        background: #090a0b;
+        font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      header,
+      main {
+        display: grid;
+        grid-template-columns: 550px 550px;
+        gap: 12px;
+      }
+
+      header {
+        height: 28px;
+        align-items: center;
+        padding-inline: 8px;
+      }
+
+      header span {
+        letter-spacing: 0.04em;
+      }
+
+      img {
+        display: block;
+        width: 550px;
+        height: 675px;
+        object-fit: contain;
+        background: #101112;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span>REFERENCE</span>
+      <span>IMPLEMENTATION · V2</span>
+    </header>
+    <main>
+      <img alt="Reference screenshot" src="./reference-550.png" />
+      <img alt="Implementation screenshot v2" src="./implementation-v2.png" />
+    </main>
+  </body>
+</html>
