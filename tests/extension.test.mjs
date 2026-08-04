@@ -169,12 +169,14 @@ test("keeps media commands inside each tab and provider requests tightly scoped"
   assert.match(panelSource, /:scope > \.right-container/);
   assert.match(
     panelSource,
-    /return \{ before: anchor, container \}/,
+    /const container = danmaku\.parentElement/,
   );
   assert.match(
     panelSource,
-    /while \(anchor\.parentElement && anchor\.parentElement !== container\)/,
+    /return \{ before: danmaku, container \}/,
   );
+  assert.doesNotMatch(panelSource, /while \(anchor\.parentElement/);
+  assert.doesNotMatch(panelSource, /before: anchor/);
   assert.doesNotMatch(panelSource, /"\.right-container"/);
   assert.match(panelSource, /data-caption-review", "in-page-module"/);
   assert.match(panelSource, /container\.insertBefore\(host, mountPoint\.before\)/);
@@ -229,6 +231,15 @@ test("keeps media commands inside each tab and provider requests tightly scoped"
     /\.prototype-stage\.is-embedded \.caption-panel\s*\{[^}]*transition:\s*none/s,
   );
   assert.match(panelStyles, /:host\s*\{[^}]*transition:\s*none\s*!important/s);
+  assert.match(
+    panelStyles,
+    /:host\s*\{[^}]*contain:\s*layout inline-size style\s*!important/s,
+  );
+  assert.match(panelStyles, /scrollbar-gutter:\s*stable/);
+  assert.match(
+    panelStyles,
+    /\.prototype-stage\.is-embedded \.transcript-row,[\s\S]*transition:\s*none/,
+  );
   const timeIconRule =
     panelStyles.match(/\.transcript-row__time svg\s*\{[^}]*\}/s)?.[0] ?? "";
   assert.doesNotMatch(timeIconRule, /transform:/);

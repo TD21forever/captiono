@@ -158,30 +158,27 @@ function bilibiliMountPoint() {
       visited.add(layout);
 
       const left = layout.querySelector(":scope > .left-container");
-      const container = layout.querySelector(":scope > .right-container");
-      if (!left?.querySelector(BILIBILI_PLAYER_SELECTOR) || !container) {
+      const rightColumn = layout.querySelector(":scope > .right-container");
+      if (!left?.querySelector(BILIBILI_PLAYER_SELECTOR) || !rightColumn) {
         continue;
       }
 
-      const rect = container.getBoundingClientRect();
+      const rect = rightColumn.getBoundingClientRect();
       if (rect.width < 260 || rect.width > 520) continue;
 
-      const danmaku = container.querySelector(
+      const danmaku = rightColumn.querySelector(
         BILIBILI_DANMAKU_SELECTORS.join(", "),
       );
       if (!danmaku) continue;
 
-      // Never inject into Bilibili's own danmaku component. Its renderer
-      // assumes control of its direct children and can remove or cover nearby
-      // native controls when an unknown child is added. Mount beside the
-      // component as a direct child of the right column instead.
-      let anchor = danmaku;
-      while (anchor.parentElement && anchor.parentElement !== container) {
-        anchor = anchor.parentElement;
-      }
-      if (anchor.parentElement === container) {
-        return { before: anchor, container };
-      }
+      // Keep Bilibili's right-column hierarchy intact. Promoting the anchor to
+      // a top-level right-column child can move Captiono ahead of native UP,
+      // action, or recommendation sections and make Bilibili rebuild that
+      // subtree on hover. Mount only as a sibling immediately before the
+      // actual danmaku list, never inside it and never above its parent.
+      const container = danmaku.parentElement;
+      if (!container || !rightColumn.contains(container)) continue;
+      return { before: danmaku, container };
     }
   }
   return null;

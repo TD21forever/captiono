@@ -133,7 +133,7 @@
   pointer-events: none !important;
   white-space: normal !important;
   transition: none !important;
-  contain: inline-size style !important;
+  contain: layout inline-size style !important;
   container-type: inline-size !important;
 }
 
@@ -756,8 +756,20 @@ textarea:focus-visible {
   overflow-x: hidden;
   overflow-y: auto;
   scrollbar-color: var(--scroll-thumb) transparent;
+  scrollbar-gutter: stable;
   scrollbar-width: thin;
   overscroll-behavior: contain;
+}
+
+/* The embedded panel lives inside host-page layout containers. Keep hover
+   feedback paint-only and immediate so entering a row cannot start a chain of
+   animated measurements in Bilibili's sidebar. */
+.prototype-stage.is-embedded .transcript-row,
+.prototype-stage.is-embedded .transcript-row__time svg,
+.prototype-stage.is-embedded .transcript-row__actions,
+.prototype-stage.is-embedded .caption-follow-resume,
+.prototype-stage.is-embedded .source-actions > button {
+  transition: none;
 }
 
 .transcript-view::-webkit-scrollbar,
