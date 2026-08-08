@@ -2,6 +2,22 @@
 
 All notable Captiono changes are documented here.
 
+## v1.6.2 — Dependency security update / 依赖安全更新
+
+### 中文
+
+- 将 Vite 从 `6.4.2` 升级到修复漏洞的 `6.4.3`。
+- 将间接依赖 PostCSS 升级到 `8.5.26`、nanoid 升级到 `3.3.18`。
+- npm 官方安全审计结果由 6 条 GitHub 告警收敛为 `0` 条漏洞。
+- 产品运行逻辑、权限范围和用户数据格式均未改变。
+
+### English
+
+- Upgrades Vite from `6.4.2` to the patched `6.4.3` release.
+- Refreshes transitive dependencies to PostCSS `8.5.26` and nanoid `3.3.18`.
+- Reduces the official npm audit result to zero known vulnerabilities.
+- Does not change product behavior, extension permissions, or stored user data.
+
 ## v1.6.1 — Interaction and host-page stability / 交互与宿主页面稳定性
 
 ### 中文

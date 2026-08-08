@@ -56,10 +56,10 @@ Captiono 会把你选中的字幕片段、时间点和批注整理成可复制�
 
 Chrome 应用商店版本正在准备中。现在可以从 GitHub Release 安装：
 
-1. 在 [Releases](https://github.com/TD21forever/captiono/releases/latest) 下载 `captiono-1.6.1.zip`。
+1. 在 [Releases](https://github.com/TD21forever/captiono/releases/latest) 下载 `captiono-1.6.2.zip`。
 2. 解压 ZIP。
 3. 打开 `chrome://extensions`，启用“开发者模式”。
-4. 点击“加载已解压的扩展程序”，选择解压后的 `captiono-1.6.1` 文件夹。
+4. 点击“加载已解压的扩展程序”，选择解压后的 `captiono-1.6.2` 文件夹。
 5. 打开一个带字幕的 YouTube 或 Bilibili 视频。
 
 更新已有安装时，请先在扩展卡片上点击刷新，再刷新已经打开的视频页。完整验收步骤见
@@ -99,7 +99,7 @@ npm run dev
 npm run build:extension
 ```
 
-构建结果位于 `dist/extension`，发布 ZIP 位于 `dist/captiono-1.6.1.zip`。
+构建结果位于 `dist/extension`，发布 ZIP 位于 `dist/captiono-1.6.2.zip`。
 
 ## 验证
 
