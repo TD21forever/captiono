@@ -13,7 +13,9 @@ const EXTENSION_RECORD_PREFIX = "caption-review:state:v3:";
 const MIGRATION_EPOCH = "1970-01-01T00:00:00.000Z";
 const memoryRecords = new Map();
 let stateWriteQueue = Promise.resolve();
+let extensionMutationQueue = Promise.resolve();
 let phraseFeedbackWriteQueue = Promise.resolve();
+let settingsWriteQueue = Promise.resolve();
 
 export const PRODUCT_STATE_SCHEMA_VERSION = 2;
 export const CAPTION_DOCUMENT_SCHEMA_VERSION = 1;
@@ -53,12 +55,8 @@ function extensionStorageArea() {
 async function readExtensionRecord(key) {
   const area = extensionStorageArea();
   if (!area) return { available: false, value: null };
-  try {
-    const result = await area.get(key);
-    return { available: true, value: result?.[key] ?? null };
-  } catch {
-    return { available: true, value: null };
-  }
+  const result = await area.get(key);
+  return { available: true, value: result?.[key] ?? null };
 }
 
 function extensionRecordKey(kind, documentId = "") {
@@ -75,25 +73,30 @@ async function readExtensionValue(key) {
 async function writeExtensionValue(key, value) {
   const area = extensionStorageArea();
   if (!area) return false;
-  await area.set({ [key]: cloneJson(value) });
-  return true;
+  const snapshot = cloneJson(value);
+  const operation = extensionMutationQueue.then(async () => {
+    await area.set({ [key]: snapshot });
+    return true;
+  });
+  extensionMutationQueue = operation.catch(() => undefined);
+  return operation;
 }
 
 async function removeExtensionValues(keys) {
   const area = extensionStorageArea();
   if (!area) return false;
-  await area.remove(keys);
-  return true;
+  const operation = extensionMutationQueue.then(async () => {
+    await area.remove(keys);
+    return true;
+  });
+  extensionMutationQueue = operation.catch(() => undefined);
+  return operation;
 }
 
 async function readAllExtensionValues() {
   const area = extensionStorageArea();
   if (!area) return null;
-  try {
-    return await area.get(null);
-  } catch {
-    return {};
-  }
+  return area.get(null);
 }
 
 function legacyAnnotationKey(documentId) {
@@ -791,28 +794,33 @@ export async function loadSettings() {
   return { ...DEFAULT_SETTINGS, ...cloneJson(state.settings) };
 }
 
-export async function saveSettings(settings) {
-  if (extensionStorageArea()) {
-    const current = await loadSettings();
-    const saved = {
-      ...DEFAULT_SETTINGS,
-      ...current,
-      ...(isRecord(settings) ? cloneJson(settings) : {}),
-    };
-    await writeExtensionValue(extensionRecordKey("settings"), saved);
+export function saveSettings(settings) {
+  const nextSettings = isRecord(settings) ? cloneJson(settings) : {};
+  const operation = settingsWriteQueue.then(async () => {
+    if (extensionStorageArea()) {
+      const current = await loadSettings();
+      const saved = {
+        ...DEFAULT_SETTINGS,
+        ...current,
+        ...nextSettings,
+      };
+      await writeExtensionValue(extensionRecordKey("settings"), saved);
+      return cloneJson(saved);
+    }
+    let saved;
+    await updateProductState((state) => {
+      saved = {
+        ...DEFAULT_SETTINGS,
+        ...state.settings,
+        ...nextSettings,
+      };
+      state.settings = saved;
+      return state;
+    });
     return cloneJson(saved);
-  }
-  let saved;
-  await updateProductState((state) => {
-    saved = {
-      ...DEFAULT_SETTINGS,
-      ...state.settings,
-      ...(isRecord(settings) ? cloneJson(settings) : {}),
-    };
-    state.settings = saved;
-    return state;
   });
-  return cloneJson(saved);
+  settingsWriteQueue = operation.catch(() => undefined);
+  return operation;
 }
 
 function savedPhraseToAnnotation(phrase) {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CAPTION_COMMAND,
   CAPTION_STATUS,
@@ -53,6 +53,7 @@ export function useCaptionBridge(media = null) {
       reason: "not-requested",
     }),
   );
+  const requestSequenceRef = useRef(0);
 
   const expectedMedia = useMemo(
     () =>
@@ -85,6 +86,11 @@ export function useCaptionBridge(media = null) {
 
   const request = useCallback(
     async (message) => {
+      const sequence = ++requestSequenceRef.current;
+      const applyIfCurrent = (nextState) =>
+        sequence === requestSequenceRef.current
+          ? applyState(nextState)
+          : null;
       const pageBridge = getPageBridge();
       if (pageBridge) {
         setState((current) => ({
@@ -95,9 +101,9 @@ export function useCaptionBridge(media = null) {
           mediaBinding: expectedMedia ?? current.mediaBinding ?? null,
         }));
         try {
-          return applyState(await pageBridge.request(message));
+          return applyIfCurrent(await pageBridge.request(message));
         } catch (error) {
-          return applyState({
+          return applyIfCurrent({
             status: CAPTION_STATUS.ERROR,
             reason: "caption-request-failed",
             message: error instanceof Error ? error.message : String(error),
@@ -107,7 +113,7 @@ export function useCaptionBridge(media = null) {
 
       const chromeApi = getChromeApi();
       if (!chromeApi?.runtime?.sendMessage) {
-        return applyState({
+        return applyIfCurrent({
           status: CAPTION_STATUS.UNAVAILABLE,
           reason: "extension-runtime-unavailable",
           message: "请在普通视频网页中打开 Captiono 扩展。",
@@ -122,7 +128,7 @@ export function useCaptionBridge(media = null) {
         mediaBinding: expectedMedia ?? current.mediaBinding ?? null,
       }));
       const response = await sendRuntimeMessage(chromeApi, message);
-      return applyState(response);
+      return applyIfCurrent(response);
     },
     [applyState, expectedMedia],
   );
@@ -130,13 +136,18 @@ export function useCaptionBridge(media = null) {
   useEffect(() => {
     const pageBridge = getPageBridge();
     if (pageBridge) {
+      let active = true;
       const unsubscribe = pageBridge.subscribe((message) => {
-        if (message?.type === "CAPTION_STATE" && message.state) {
+        if (active && message?.type === "CAPTION_STATE" && message.state) {
           applyState(message.state);
         }
       });
       void request({ type: CAPTION_COMMAND.GET });
-      return unsubscribe;
+      return () => {
+        active = false;
+        requestSequenceRef.current += 1;
+        unsubscribe();
+      };
     }
 
     const chromeApi = getChromeApi();
@@ -158,7 +169,10 @@ export function useCaptionBridge(media = null) {
     chromeApi.runtime.onMessage.addListener(handleMessage);
     void request({ type: CAPTION_COMMAND.GET });
 
-    return () => chromeApi.runtime.onMessage.removeListener(handleMessage);
+    return () => {
+      requestSequenceRef.current += 1;
+      chromeApi.runtime.onMessage.removeListener(handleMessage);
+    };
   }, [applyState, request]);
 
   const refresh = useCallback(

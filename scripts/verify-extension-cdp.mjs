@@ -81,6 +81,110 @@ async function evaluate(session, expression) {
   return response.result?.value;
 }
 
+const panelShadowBackendNodeIds = new WeakMap();
+
+function nodeAttribute(node, name) {
+  const attributes = node?.attributes ?? [];
+  for (let index = 0; index < attributes.length; index += 2) {
+    if (attributes[index] === name) return attributes[index + 1] ?? "";
+  }
+  return null;
+}
+
+function findNode(root, predicate) {
+  const pending = [root];
+  const visited = new Set();
+  while (pending.length) {
+    const node = pending.pop();
+    if (!node) continue;
+    const identity = node.backendNodeId ?? node.nodeId;
+    if (identity && visited.has(identity)) continue;
+    if (identity) visited.add(identity);
+    if (predicate(node)) return node;
+
+    pending.push(
+      ...(node.children ?? []),
+      ...(node.shadowRoots ?? []),
+      ...(node.pseudoElements ?? []),
+      ...(node.distributedNodes ?? []),
+    );
+    if (node.contentDocument) pending.push(node.contentDocument);
+    if (node.templateContent) pending.push(node.templateContent);
+  }
+  return null;
+}
+
+async function findPanelShadowBackendNodeId(session) {
+  const { root } = await session.send("DOM.getDocument", {
+    depth: -1,
+    pierce: true,
+  });
+  const host = findNode(
+    root,
+    (node) => nodeAttribute(node, "id") === "caption-review-extension-host",
+  );
+  const shadow = host?.shadowRoots?.[0];
+  return shadow?.backendNodeId ?? null;
+}
+
+async function resolvePanelShadow(session) {
+  let backendNodeId = panelShadowBackendNodeIds.get(session);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!backendNodeId) {
+      backendNodeId = await findPanelShadowBackendNodeId(session);
+      if (!backendNodeId) return null;
+      panelShadowBackendNodeIds.set(session, backendNodeId);
+    }
+
+    try {
+      const { object } = await session.send("DOM.resolveNode", {
+        backendNodeId,
+      });
+      if (!object?.objectId) {
+        throw new Error("CDP did not return an object for Captiono ShadowRoot");
+      }
+      return object;
+    } catch (error) {
+      panelShadowBackendNodeIds.delete(session);
+      backendNodeId = null;
+      if (attempt === 1) throw error;
+    }
+  }
+  return null;
+}
+
+async function callOnPanelShadow(
+  session,
+  functionDeclaration,
+  argumentValues = [],
+) {
+  const shadow = await resolvePanelShadow(session);
+  if (!shadow) return undefined;
+
+  try {
+    const response = await session.send("Runtime.callFunctionOn", {
+      arguments: argumentValues.map((value) => ({ value })),
+      awaitPromise: true,
+      functionDeclaration,
+      objectId: shadow.objectId,
+      returnByValue: true,
+      userGesture: true,
+    });
+    if (response.exceptionDetails) {
+      throw new Error(
+        response.exceptionDetails.exception?.description ??
+          response.exceptionDetails.text ??
+          "Shadow DOM runtime evaluation failed",
+      );
+    }
+    return response.result?.value;
+  } finally {
+    await session.send("Runtime.releaseObject", {
+      objectId: shadow.objectId,
+    });
+  }
+}
+
 async function waitFor(session, expression, options = {}) {
   const timeoutMs = options.timeoutMs ?? 45_000;
   const intervalMs = options.intervalMs ?? 250;
@@ -96,13 +200,28 @@ async function waitFor(session, expression, options = {}) {
   );
 }
 
+async function waitForPanel(session, functionDeclaration, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 45_000;
+  const intervalMs = options.intervalMs ?? 250;
+  const startedAt = Date.now();
+  let lastValue;
+  while (Date.now() - startedAt < timeoutMs) {
+    lastValue = await callOnPanelShadow(session, functionDeclaration);
+    if (lastValue) return lastValue;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(
+    `${options.label ?? "panel condition"} did not become ready in ${timeoutMs}ms; last value: ${JSON.stringify(lastValue)}`,
+  );
+}
+
 async function inspectPanel(session) {
-  return evaluate(
+  const inspection = await callOnPanelShadow(
     session,
-    `(() => {
+    `function() {
+      const root = this;
       const hosts = [...document.querySelectorAll("#caption-review-extension-host")];
-      const host = hosts[0];
-      const root = host?.shadowRoot;
+      const host = root.host;
       const panel = root?.querySelector(".caption-review-panel-surface");
       const transcript = root?.querySelector(".transcript-view");
       const firstRow = root?.querySelector(".transcript-row");
@@ -117,7 +236,7 @@ async function inspectPanel(session) {
         : 0;
       return {
         hostCount: hosts.length,
-        hasShadowRoot: Boolean(root),
+        hasShadowRoot: true,
         open: host?.dataset.open ?? null,
         complementaryCount: root?.querySelectorAll('aside[aria-label="Captiono"]').length ?? 0,
         sourceTitle: root?.querySelector(".source-title")?.textContent?.trim() ?? "",
@@ -137,8 +256,12 @@ async function inspectPanel(session) {
         pageHorizontalOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
         href: location.href,
       };
-    })()`,
+    }`,
   );
+  if (!inspection) {
+    throw new Error("Captiono closed ShadowRoot is no longer available");
+  }
+  return inspection;
 }
 
 async function capture(session, fileName) {
@@ -153,15 +276,16 @@ async function capture(session, fileName) {
 }
 
 async function clickByLabel(session, label) {
-  return evaluate(
+  return callOnPanelShadow(
     session,
-    `(() => {
-      const root = document.querySelector("#caption-review-extension-host")?.shadowRoot;
+    `function(label) {
+      const root = this;
       const button = [...(root?.querySelectorAll("button") ?? [])]
-        .find((candidate) => candidate.getAttribute("aria-label") === ${JSON.stringify(label)});
+        .find((candidate) => candidate.getAttribute("aria-label") === label);
       button?.click();
       return Boolean(button);
-    })()`,
+    }`,
+    [label],
   );
 }
 
@@ -170,9 +294,10 @@ async function preparePage(target) {
   await session.ready;
   await session.send("Page.enable");
   await session.send("Runtime.enable");
-  await waitFor(
+  await session.send("DOM.enable");
+  await waitForPanel(
     session,
-    `Boolean(document.querySelector("#caption-review-extension-host")?.shadowRoot?.querySelector(".caption-panel"))`,
+    `function() { return Boolean(this.querySelector(".caption-panel")); }`,
     {
       label: "automatically injected Captiono Shadow DOM panel",
       timeoutMs: 12_000,
@@ -215,14 +340,14 @@ if (
 }
 report.primary.openScreenshot = await capture(primary, "youtube-open.png");
 
-await evaluate(
+await callOnPanelShadow(
   primary,
-  `(() => {
-    const root = document.querySelector("#caption-review-extension-host")?.shadowRoot;
+  `function() {
+    const root = this;
     const transcript = root?.querySelector(".transcript-view");
     if (transcript) transcript.scrollTop = 420;
     return transcript?.scrollTop ?? null;
-  })()`,
+  }`,
 );
 report.primary.scrollBeforeCollapse = (await inspectPanel(primary)).scrollTop;
 if (!(await clickByLabel(primary, "收起 Captiono 面板"))) {
@@ -277,15 +402,19 @@ if (Math.abs(report.primary.reopened.hostWidth - report.primary.reopened.panelWi
   );
 }
 
-const firstCopyLabel = await evaluate(
+const firstCopyLabel = await callOnPanelShadow(
   primary,
-  `document.querySelector("#caption-review-extension-host")?.shadowRoot?.querySelector(".transcript-row__copy")?.getAttribute("aria-label") ?? ""`,
+  `function() {
+    return this.querySelector(".transcript-row__copy")?.getAttribute("aria-label") ?? "";
+  }`,
 );
 if (firstCopyLabel) {
   await clickByLabel(primary, firstCopyLabel);
-  await waitFor(
+  await waitForPanel(
     primary,
-    `document.querySelector("#caption-review-extension-host")?.shadowRoot?.querySelector(".toast")?.textContent?.includes("已复制整句") ?? false`,
+    `function() {
+      return this.querySelector(".toast")?.textContent?.includes("已复制整句") ?? false;
+    }`,
     { label: "copy confirmation", timeoutMs: 5_000 },
   );
   report.primary.copySentence = true;

@@ -13,7 +13,7 @@
   --paper-deep: #f3eee4;
   --ink: #272522;
   --ink-soft: #686158;
-  --muted: #8c8479;
+  --muted: #756e65;
   --line: #ded7cb;
   --line-strong: #cfc4b4;
   --indigo: #4a4b9a;
@@ -150,7 +150,7 @@
 }
 
 :host([data-platform="bilibili"][data-open="true"]) {
-  height: clamp(510px, 69vh, 750px) !important;
+  height: clamp(360px, 56vh, 560px) !important;
 }
 
 :host([data-platform="bilibili"][data-open="false"]) {
@@ -219,6 +219,7 @@ textarea:focus-visible {
 }
 
 .prototype-stage {
+  position: relative;
   display: grid;
   min-height: 100dvh;
   padding: 10px;
@@ -712,10 +713,6 @@ textarea:focus-visible {
   color: var(--muted);
 }
 
-.search-field input:focus {
-  outline: 0;
-}
-
 .workbench {
   position: relative;
   display: grid;
@@ -800,6 +797,8 @@ textarea:focus-visible {
   align-items: start;
   gap: 12px;
   border-bottom: 1px solid var(--row-border);
+  content-visibility: auto;
+  contain-intrinsic-size: auto 82px;
   transition:
     background 140ms ease,
     border-color 140ms ease;
@@ -933,6 +932,7 @@ textarea:focus-visible {
   border: 2px solid var(--paper);
   border-radius: 99px;
   cursor: pointer;
+  user-select: none;
 }
 
 .annotation-inline-marker:hover,
@@ -1594,12 +1594,16 @@ textarea:focus-visible {
 }
 
 .phrase-tooltip {
-  position: fixed;
+  position: absolute;
   z-index: 100;
   display: grid;
   width: 274px;
+  max-width: calc(100% - 24px);
+  max-height: min(240px, calc(100dvh - 24px));
   padding: 14px;
   gap: 8px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   color: var(--ink);
   background: var(--paper-raised);
   border: 1px solid var(--line-strong);
@@ -1653,13 +1657,14 @@ textarea:focus-visible {
 }
 
 .selection-toolbar {
-  position: fixed;
+  position: absolute;
   z-index: 110;
   display: flex;
   max-width: calc(100vw - 24px);
   padding: 5px;
   gap: 3px;
   overflow-x: auto;
+  overscroll-behavior: contain;
   background: #2b2925;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 9px;
@@ -1672,6 +1677,7 @@ textarea:focus-visible {
   min-height: 31px;
   padding: 0 8px;
   align-items: center;
+  flex: 0 0 auto;
   gap: 5px;
   color: #f3eee7;
   font-size: 11px;
@@ -1680,6 +1686,9 @@ textarea:focus-visible {
   border: 0;
   border-radius: 6px;
   cursor: pointer;
+  white-space: nowrap;
+  word-break: keep-all;
+  writing-mode: horizontal-tb;
 }
 
 .selection-toolbar button:hover {
@@ -1695,10 +1704,13 @@ textarea:focus-visible {
 }
 
 .comment-popover {
-  position: fixed;
+  position: absolute;
   z-index: 115;
   display: grid;
   width: min(340px, calc(100vw - 24px));
+  max-width: calc(100vw - 16px);
+  max-height: min(260px, calc(100dvh - 16px));
+  min-width: 0;
   min-height: 164px;
   padding: 13px;
   color: #f7f7f7;
@@ -1706,6 +1718,34 @@ textarea:focus-visible {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 18px;
   box-shadow: 0 18px 46px rgba(18, 18, 18, 0.34);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.prototype-stage.is-embedded .overflow-menu {
+  top: 63px;
+  right: 8px;
+  width: min(268px, calc(100cqw - 16px));
+  max-height: calc(100% - 71px);
+  animation: none;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.prototype-stage.is-embedded .overflow-control {
+  position: static;
+}
+
+/* Anchor the embedded menu to the panel rather than the 56px header. This
+   makes percentage height constraints use the actual in-page module height. */
+.prototype-stage.is-embedded .source-header {
+  position: static;
+}
+
+.prototype-stage.is-embedded .overflow-menu,
+.prototype-stage.is-embedded .overflow-menu * {
+  animation: none !important;
+  transition: none !important;
 }
 
 .comment-popover textarea {
@@ -1718,7 +1758,6 @@ textarea:focus-visible {
   line-height: 1.55;
   background: transparent;
   border: 0;
-  outline: 0;
 }
 
 .comment-popover textarea::placeholder {
@@ -1737,6 +1776,7 @@ textarea:focus-visible {
 }
 
 .comment-popover footer > div {
+  flex: 0 0 auto;
   gap: 8px;
 }
 
@@ -1751,6 +1791,7 @@ textarea:focus-visible {
   border: 1px solid transparent;
   border-radius: 999px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .comment-popover button:hover,
@@ -1794,6 +1835,9 @@ textarea:focus-visible {
   padding: 0 4px 4px;
   align-items: center;
   gap: 5px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
 }
 
 .thread-editor-popover__tabs button {

@@ -160,7 +160,7 @@ async function resolveVideoIdentity(request, fetchImpl) {
   const directAid = positiveInteger(request.aid);
   const directCid = positiveInteger(request.cid);
   const mediaId = normalizeMediaId(request.mediaId);
-  if (directAid && directCid) {
+  if (directAid && directCid && !mediaId) {
     return { aid: directAid, cid: directCid, mediaId };
   }
 
@@ -191,6 +191,22 @@ async function resolveVideoIdentity(request, fetchImpl) {
     const episodes = payload?.result?.episodes;
     const episode = Array.isArray(episodes)
       ? episodes.find((item) => Number(item?.id) === episodeId)
+      : null;
+    const aid = positiveInteger(episode?.aid);
+    const cid = positiveInteger(episode?.cid);
+    if (aid && cid) return { aid, cid, mediaId };
+  }
+
+  if (mediaId.startsWith("ss")) {
+    const seasonId = positiveInteger(mediaId.slice(2));
+    const payload = await fetchJson(
+      fetchImpl,
+      `https://api.bilibili.com/pgc/view/web/season?season_id=${seasonId}`,
+    );
+    const episodes = payload?.result?.episodes;
+    const pageNumber = Math.max(1, positiveInteger(request.page) ?? 1);
+    const episode = Array.isArray(episodes)
+      ? episodes[pageNumber - 1] ?? episodes[0]
       : null;
     const aid = positiveInteger(episode?.aid);
     const cid = positiveInteger(episode?.cid);

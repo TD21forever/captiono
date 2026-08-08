@@ -46,6 +46,10 @@ import {
   transitionCaptionFollowMode,
   validateStructuredPhraseCandidates,
 } from "../src/lib/index.js";
+import {
+  CAPTION_FOLLOW_IDLE_MS,
+  shouldResumeCaptionFollowAfterIdle,
+} from "../src/lib/captionFollow.js";
 
 test("parses SRT into normalized millisecond cues", () => {
   const cues = parseTranscript(SAMPLE_TRANSCRIPT);
@@ -207,6 +211,41 @@ test("caption follow state respects manual browsing and settled seeking", () => 
       userScrolled: true,
     }),
     CAPTION_FOLLOW_MODE.MANUAL,
+  );
+});
+
+test("caption follow only resumes after a fully idle manual pause", () => {
+  assert.equal(CAPTION_FOLLOW_IDLE_MS, 8_000);
+  assert.equal(
+    shouldResumeCaptionFollowAfterIdle({
+      mode: CAPTION_FOLLOW_MODE.MANUAL,
+    }),
+    true,
+  );
+  for (const blocked of [
+    { pointerInside: true },
+    { focusBlocked: true },
+    { interactionBlocked: true },
+  ]) {
+    assert.equal(
+      shouldResumeCaptionFollowAfterIdle({
+        mode: CAPTION_FOLLOW_MODE.MANUAL,
+        ...blocked,
+      }),
+      false,
+    );
+  }
+  assert.equal(
+    shouldResumeCaptionFollowAfterIdle({
+      mode: CAPTION_FOLLOW_MODE.SEEKING,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldResumeCaptionFollowAfterIdle({
+      mode: CAPTION_FOLLOW_MODE.FOLLOWING,
+    }),
+    false,
   );
 });
 

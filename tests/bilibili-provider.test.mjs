@@ -28,6 +28,17 @@ test("loads the preferred English Bilibili subtitle and normalizes cues", async 
   const calls = [];
   const fetchImpl = async (url, init) => {
     calls.push({ init, url });
+    if (url.includes("/x/web-interface/view")) {
+      return jsonResponse(
+        {
+          data: {
+            aid: 123,
+            pages: [{ page: 1, cid: 456 }],
+          },
+        },
+        url,
+      );
+    }
     if (url.includes("/x/player/wbi/v2")) {
       return jsonResponse(
         {
@@ -114,7 +125,8 @@ test("loads the preferred English Bilibili subtitle and normalizes cues", async 
     },
   ]);
   assert.equal(calls[0].init.credentials, "include");
-  assert.equal(calls[1].init.credentials, "omit");
+  assert.equal(calls[1].init.credentials, "include");
+  assert.equal(calls[2].init.credentials, "omit");
 });
 
 test("resolves a BV page before requesting its subtitle manifest", async () => {
@@ -145,6 +157,41 @@ test("resolves a BV page before requesting its subtitle manifest", async () => {
 
   const result = await loadBilibiliCaptions(
     { mediaId: "BV1xx411c7mD", page: 2 },
+    fetchImpl,
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "bilibili-no-caption-tracks");
+  assert.equal(calls.length, 2);
+});
+
+test("resolves an ss season URL without trusting page-provided aid or cid", async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(url);
+    if (url.includes("/pgc/view/web/season")) {
+      assert.match(url, /season_id=4242/);
+      return jsonResponse(
+        {
+          result: {
+            episodes: [
+              { aid: 501, cid: 601 },
+              { aid: 502, cid: 602 },
+            ],
+          },
+        },
+        url,
+      );
+    }
+    if (url.includes("/x/player/wbi/v2")) {
+      assert.match(url, /aid=502/);
+      assert.match(url, /cid=602/);
+      return jsonResponse({ data: { subtitle: { subtitles: [] } } }, url);
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  const result = await loadBilibiliCaptions(
+    { mediaId: "ss4242", page: 2, aid: 999, cid: 999 },
     fetchImpl,
   );
   assert.equal(result.ok, false);

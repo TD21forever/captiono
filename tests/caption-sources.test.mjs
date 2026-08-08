@@ -276,6 +276,9 @@ test("extension exposes automatic YouTube and Bilibili caption bridges", async (
   assert.match(playerBridge, /player\.getOption\("captions", "track"\)/);
   assert.match(playerBridge, /player\.toggleSubtitles\(\)/);
   assert.match(playerBridge, /new PerformanceObserver/);
+  assert.match(playerBridge, /const MAX_DISCOVERED_TRACKS = 120/);
+  assert.match(playerBridge, /\.slice\(0, MAX_DISCOVERED_TRACKS\)/);
+  assert.match(playerBridge, /\.slice\(0, MAX_TRACK_LABEL_LENGTH\)/);
   assert.doesNotMatch(playerBridge, /\bfetch\s*\(/);
   assert.doesNotMatch(playerBridge, /\bpostMessage\s*\(/);
   assert.doesNotMatch(playerBridge, /\bchrome\./);
@@ -321,6 +324,7 @@ test("main-world bridge captures the signed request minted by the YouTube player
   };
   const entries = [];
   const setCalls = [];
+  const subtitleTransitions = [];
   let observerCallback = null;
   let subtitlesEnabled = true;
   let toggleCount = 0;
@@ -337,6 +341,11 @@ test("main-world bridge captures the signed request minted by the YouTube player
     setOption(namespace, option, track) {
       setCalls.push({ namespace, option, track });
       if (option === "reload") return;
+      assert.equal(
+        subtitlesEnabled,
+        true,
+        "the learner's current captions must be re-enabled before selection capture continues",
+      );
       subtitlesEnabled = true;
       const entry = { name: signedUrl, startTime: 120 };
       entries.push(entry);
@@ -350,6 +359,7 @@ test("main-world bridge captures the signed request minted by the YouTube player
     toggleSubtitles() {
       toggleCount += 1;
       subtitlesEnabled = !subtitlesEnabled;
+      subtitleTransitions.push(subtitlesEnabled);
     },
   };
   const sandbox = {
@@ -418,7 +428,8 @@ test("main-world bridge captures the signed request minted by the YouTube player
   assert.equal(setCalls.length, 2);
   assert.equal(setCalls[0].option, "reload");
   assert.equal(setCalls[1].option, "track");
-  assert.equal(toggleCount, 1);
+  assert.equal(toggleCount, 2);
+  assert.deepEqual(subtitleTransitions, [false, true]);
   assert.equal(subtitlesEnabled, true);
 });
 
@@ -498,7 +509,7 @@ test("page bridge returns real TextTrack cues bound to the current video", async
     },
     innerHeight: 720,
     innerWidth: 1280,
-    location: { href: "https://www.ted.com/talks/example#player" },
+    location: { href: "https://www.youtube.com/watch?v=text-track-test#player" },
     MutationObserver: class {
       observe() {}
       disconnect() {}
@@ -526,7 +537,10 @@ test("page bridge returns real TextTrack cues bound to the current video", async
   });
 
   assert.equal(response.status, "ready");
-  assert.equal(response.document.url, "https://www.ted.com/talks/example");
+  assert.equal(
+    response.document.url,
+    "https://www.youtube.com/watch?v=text-track-test",
+  );
   assert.equal(response.document.title, "How ideas spread");
   assert.equal(
     response.document.mediaSrc,
@@ -552,8 +566,246 @@ test("page bridge returns real TextTrack cues bound to the current video", async
     "preloaded cues should be read without mutating the page track",
   );
   assert.ok(
-    published.some((message) => message.type === "CAPTION_STATE"),
+    !published.some((message) => message.type === "CAPTION_STATE"),
+    "high-frequency caption state must stay on the in-page bridge",
   );
+});
+
+test("refreshes once when a supported page receives or replaces its primary video", async () => {
+  const source = await readFile(
+    path.join(root, "extension/content-script.js"),
+    "utf8",
+  );
+
+  async function runScenario({ href, platform }) {
+    let intervalCallback = null;
+    let nextTimerId = 1;
+    const timers = new Map();
+    const observedTargets = [];
+    const videos = [];
+    let youtubePlayer = null;
+
+    const settle = async () => {
+      for (let index = 0; index < 8; index += 1) {
+        await Promise.resolve();
+      }
+    };
+    const drainTimers = async () => {
+      while (timers.size > 0) {
+        const callbacks = Array.from(timers.values());
+        timers.clear();
+        callbacks.forEach((callback) => callback());
+        await settle();
+      }
+    };
+
+    function createVideo(label, player = null) {
+      const cue = {
+        id: `cue-${label}`,
+        startTime: 1,
+        endTime: 3,
+        text: `Caption ${label}`,
+      };
+      let mode = "disabled";
+      const track = {
+        id: `track-${label}`,
+        kind: "subtitles",
+        label: "English",
+        language: "en",
+        cues: [cue],
+        addEventListener() {},
+      };
+      Object.defineProperty(track, "mode", {
+        get() {
+          return mode;
+        },
+        set(value) {
+          mode = value;
+        },
+      });
+      const trackElement = {
+        id: `track-${label}`,
+        kind: "subtitles",
+        label: "English",
+        srclang: "en",
+        readyState: 2,
+        track,
+      };
+      const video = {
+        tagName: "VIDEO",
+        currentSrc: `https://media.example/${label}.mp4`,
+        currentTime: 1.5,
+        duration: 60,
+        paused: true,
+        readyState: 4,
+        closest(selector) {
+          if (selector === "video") return video;
+          if (selector === "#movie_player") return player;
+          return null;
+        },
+        getBoundingClientRect() {
+          return { left: 0, top: 0, right: 1280, bottom: 720 };
+        },
+        matches(selector) {
+          return selector.includes("video");
+        },
+        querySelectorAll(selector) {
+          return selector === "track" ? [trackElement] : [];
+        },
+        play: async () => {},
+        pause() {},
+      };
+      video[["text", "Tracks"].join("")] = [track];
+      return { video };
+    }
+
+    const sandbox = {
+      URL,
+      clearInterval() {},
+      clearTimeout(timerId) {
+        timers.delete(timerId);
+      },
+      chrome: {
+        runtime: {
+          onMessage: {
+            addListener() {},
+            removeListener() {},
+          },
+          sendMessage() {
+            throw new Error("a preloaded TextTrack must not call the worker");
+          },
+        },
+      },
+      document: {
+        documentElement: {},
+        hidden: false,
+        title: "Late player",
+        addEventListener() {},
+        removeEventListener() {},
+        querySelector(selector) {
+          return selector.includes("movie_player") ? youtubePlayer : null;
+        },
+        querySelectorAll(selector) {
+          return selector.includes("video") ? videos : [];
+        },
+      },
+      fetch() {
+        throw new Error("a preloaded TextTrack must not use a manifest");
+      },
+      innerHeight: 720,
+      innerWidth: 1280,
+      location: { href },
+      MutationObserver: class {
+        disconnect() {}
+        observe(target, options) {
+          observedTargets.push({ options, target });
+        }
+      },
+      navigator: { languages: ["en-US"] },
+      setInterval(callback) {
+        intervalCallback = callback;
+        return 1;
+      },
+      setTimeout(callback) {
+        const timerId = nextTimerId;
+        nextTimerId += 1;
+        timers.set(timerId, callback);
+        return timerId;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+
+    vm.runInNewContext(source, sandbox, {
+      filename: "extension/content-script.js",
+    });
+    assert.equal(typeof intervalCallback, "function");
+
+    // Exhaust the one initial media-key refresh while the platform player is
+    // still absent. No retry loop should remain after this point.
+    await settle();
+    await drainTimers();
+    assert.equal(timers.size, 0);
+    const readyStates = [];
+    sandbox.__captionReviewPageBridge.subscribe((message) => {
+      if (message?.type === "CAPTION_STATE" && message.state?.status === "ready") {
+        readyStates.push(message.state);
+      }
+    });
+
+    const firstPlayer = platform === "youtube" ? { id: "player-one" } : null;
+    const first = createVideo(`${platform}-one`, firstPlayer);
+    youtubePlayer = firstPlayer;
+    videos.splice(0, videos.length, first.video);
+    intervalCallback();
+    assert.equal(
+      timers.size,
+      1,
+      `${platform} must schedule one refresh when its video appears`,
+    );
+    await drainTimers();
+    const firstState = await sandbox.__captionReviewPageBridge.request({
+      type: "GET_CAPTION_STATE",
+    });
+    assert.equal(firstState.status, "ready");
+    assert.equal(firstState.document.cues[0].text, `Caption ${platform}-one`);
+    assert.equal(readyStates.length, 1);
+
+    intervalCallback();
+    assert.equal(
+      timers.size,
+      0,
+      `${platform} must not poll captions again for the same video instance`,
+    );
+
+    const secondPlayer = platform === "youtube" ? { id: "player-two" } : null;
+    const second = createVideo(`${platform}-two`, secondPlayer);
+    youtubePlayer = secondPlayer;
+    videos.splice(0, videos.length, second.video);
+    intervalCallback();
+    assert.equal(
+      timers.size,
+      1,
+      `${platform} must schedule one refresh when the player element is replaced`,
+    );
+    await drainTimers();
+    const secondState = await sandbox.__captionReviewPageBridge.request({
+      type: "GET_CAPTION_STATE",
+    });
+    assert.equal(secondState.status, "ready");
+    assert.equal(secondState.document.cues[0].text, `Caption ${platform}-two`);
+    assert.equal(readyStates.length, 2);
+
+    if (platform === "youtube") {
+      assert.ok(
+        observedTargets.some(
+          ({ options, target }) => target === firstPlayer && options.childList,
+        ),
+        "the first YouTube player must receive the scoped structure observer",
+      );
+      assert.ok(
+        observedTargets.some(
+          ({ options, target }) => target === secondPlayer && options.childList,
+        ),
+        "a replacement YouTube player must receive the scoped structure observer",
+      );
+      assert.ok(
+        observedTargets.some(
+          ({ options, target }) => target === second.video && options.attributes,
+        ),
+        "the replacement YouTube video must receive the attribute observer",
+      );
+    }
+  }
+
+  await runScenario({
+    href: "https://www.youtube.com/watch?v=abcdefghijk",
+    platform: "youtube",
+  });
+  await runScenario({
+    href: "https://www.bilibili.com/video/BV1xx411c7mD",
+    platform: "bilibili",
+  });
 });
 
 test("isolated bridge discovers player captions when the inline manifest is missing", async () => {
@@ -731,11 +983,8 @@ test("isolated bridge discovers player captions when the inline manifest is miss
   assert.equal(fetchCalls[0].init.credentials, "omit");
   assert.equal(fetchCalls[0].init.redirect, "error");
   assert.ok(
-    published.some(
-      (message) =>
-        message.type === "CAPTION_STATE" &&
-        message.state.status === "ready",
-    ),
+    !published.some((message) => message.type === "CAPTION_STATE"),
+    "automatic refresh must not wake the service worker with UI state",
   );
 });
 
@@ -922,11 +1171,13 @@ test("falls back from an empty TextTrack to a same-origin YouTube page manifest"
   assert.equal(fetchedUrl.searchParams.get("fmt"), "json3");
   assert.equal(fetchCalls[0].init.credentials, "omit");
   assert.equal(fetchCalls[0].init.redirect, "error");
+  assert.equal(
+    emptyTrack.mode,
+    "disabled",
+    "Captiono must restore a host TextTrack after probing it",
+  );
   assert.ok(
-    published.some(
-      (message) =>
-        message.type === "CAPTION_STATE" &&
-        message.state.status === "loading",
-    ),
+    !published.some((message) => message.type === "CAPTION_STATE"),
+    "loading transitions must stay on the in-page bridge",
   );
 });

@@ -34,6 +34,40 @@ function youtubeVideoId(value) {
   }
 }
 
+function normalizeBilibiliRequest(message, sender) {
+  let url;
+  try {
+    url = new URL(sender.url || sender.tab?.url);
+  } catch {
+    return null;
+  }
+  if (!isBilibiliPage(url.href)) return null;
+
+  const mediaId =
+    url.pathname.match(/\/video\/(BV[a-zA-Z0-9]+)/i)?.[1] ||
+    url.pathname.match(/\/bangumi\/play\/((?:ep|ss)\d+)/i)?.[1] ||
+    "";
+  const requestedMediaId = String(message?.mediaId ?? "").trim();
+  if (!mediaId || requestedMediaId !== mediaId) return null;
+
+  const page = Math.max(
+    1,
+    Math.min(10_000, Math.round(Number(url.searchParams.get("p"))) || 1),
+  );
+  const trackId = String(message?.trackId ?? "").trim();
+  const language = String(message?.language ?? "").trim().toLowerCase();
+  if (
+    (trackId && !/^bilibili-[a-z0-9._-]{1,150}$/i.test(trackId)) ||
+    (language && !/^[a-z0-9-]{1,40}$/i.test(language))
+  ) {
+    return null;
+  }
+
+  // aid/cid parsed from page-owned inline state are deliberately ignored.
+  // Resolve the current URL identity again in the trusted service worker.
+  return { language, mediaId, page, trackId };
+}
+
 function normalizePlayerRequest(message) {
   const videoId = String(message?.videoId ?? "").trim();
   const discoverOnly = message?.discoverOnly === true;
@@ -134,10 +168,11 @@ async function captureFromYouTubePlayer(message, sender) {
 
 async function captureFromBilibili(message, sender) {
   const tabId = sender.tab?.id;
+  const request = normalizeBilibiliRequest(message, sender);
   if (
+    !request ||
     !Number.isInteger(tabId) ||
-    sender.frameId !== 0 ||
-    !isBilibiliPage(sender.url || sender.tab?.url)
+    sender.frameId !== 0
   ) {
     return {
       ok: false,
@@ -148,17 +183,16 @@ async function captureFromBilibili(message, sender) {
 
   const cacheKey = [
     tabId,
-    String(message.mediaId ?? ""),
-    String(message.aid ?? ""),
-    String(message.cid ?? ""),
-    String(message.trackId ?? ""),
-    String(message.language ?? ""),
+    request.mediaId,
+    request.page,
+    request.trackId,
+    request.language,
   ].join("\n");
   if (bilibiliCaptionRequests.has(cacheKey)) {
     return bilibiliCaptionRequests.get(cacheKey);
   }
 
-  const capture = loadBilibiliCaptions(message).catch((error) => ({
+  const capture = loadBilibiliCaptions(request).catch((error) => ({
     ok: false,
     reason: "bilibili-caption-fetch-failed",
     message:

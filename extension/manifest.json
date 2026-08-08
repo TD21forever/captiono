@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Captiono",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "从 YouTube 和 Bilibili 视频里拾取表达、批注字幕并导出学习记录。",
   "minimum_chrome_version": "139",
+  "incognito": "not_allowed",
   "permissions": [
     "scripting",
     "storage"
@@ -17,6 +18,9 @@
   "background": {
     "service_worker": "background.js",
     "type": "module"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src https://*.bilibili.com https://*.hdslb.com"
   },
   "icons": {
     "16": "icons/icon16.png",

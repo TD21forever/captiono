@@ -12,6 +12,22 @@ export const CAPTION_FOLLOW_EVENT = Object.freeze({
   DOCUMENT_CHANGED: "document-changed",
 });
 
+export const CAPTION_FOLLOW_IDLE_MS = 8_000;
+
+export function shouldResumeCaptionFollowAfterIdle({
+  mode,
+  pointerInside = false,
+  focusBlocked = false,
+  interactionBlocked = false,
+} = {}) {
+  return (
+    mode === CAPTION_FOLLOW_MODE.MANUAL &&
+    !pointerInside &&
+    !focusBlocked &&
+    !interactionBlocked
+  );
+}
+
 export function transitionCaptionFollowMode(
   current = CAPTION_FOLLOW_MODE.FOLLOWING,
   event,

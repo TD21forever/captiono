@@ -1,7 +1,9 @@
 import {
+  memo,
   startTransition,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -34,8 +36,6 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import {
-  CAPTION_FOLLOW_EVENT,
-  CAPTION_FOLLOW_MODE,
   createAnnotationThread,
   deleteAnnotationThread,
   editAnnotationThread,
@@ -64,8 +64,14 @@ import {
   saveSavedPhrases,
   saveSettings,
   threadToAnnotation,
-  transitionCaptionFollowMode,
 } from "./lib/index.js";
+import {
+  CAPTION_FOLLOW_EVENT,
+  CAPTION_FOLLOW_IDLE_MS,
+  CAPTION_FOLLOW_MODE,
+  shouldResumeCaptionFollowAfterIdle,
+  transitionCaptionFollowMode,
+} from "./lib/captionFollow.js";
 import {
   BILIBILI_PAGE_SUBTITLE_SOURCE,
   CAPTION_STATUS,
@@ -75,6 +81,10 @@ import {
 } from "./lib/captionSources.js";
 import { useCaptionBridge } from "./hooks/useCaptionBridge.js";
 import { useMediaBridge } from "./hooks/useMediaBridge.js";
+import {
+  rangeTextLengthIgnoringUi,
+  rectRelativeTo,
+} from "./lib/floatingGeometry.js";
 
 const KIND_META = {
   question: {
@@ -102,6 +112,16 @@ const KIND_META = {
     color: "violet",
   },
 };
+const EMPTY_LIST = Object.freeze([]);
+const CAPTION_FOLLOW_SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
 
 const THEME_OPTIONS = Object.freeze([
   { value: "system", label: "系统", icon: IconDeviceDesktop },
@@ -148,6 +168,27 @@ function formatTime(ms) {
   return `${String(minutes).padStart(2, "0")}:${String(
     seconds % 60,
   ).padStart(2, "0")}`;
+}
+
+function findActiveSentence(sentences, currentMs) {
+  let low = 0;
+  let high = sentences.length - 1;
+  let candidateIndex = -1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (sentences[middle].startMs <= currentMs) {
+      candidateIndex = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  if (candidateIndex < 0) return null;
+  const sentence = sentences[candidateIndex];
+  const endMs =
+    sentence.endMs ??
+    sentence.startMs + Math.max(sentence.text.length * 70, 2000);
+  return currentMs < endMs ? sentence : null;
 }
 
 function fingerprintTranscript(title, segments) {
@@ -274,6 +315,43 @@ function clearTextSelection(container) {
     root.getSelection()?.removeAllRanges();
   }
   globalThis.getSelection?.()?.removeAllRanges();
+}
+
+function useStableEvent(handler) {
+  const handlerRef = useRef(handler);
+  handlerRef.current = handler;
+  return useCallback((...args) => handlerRef.current(...args), []);
+}
+
+function listenForShadowAwarePointerDown(element, listener, capture = false) {
+  const eventRoot = element?.getRootNode?.();
+  const ownerDocument = element?.ownerDocument ?? globalThis.document;
+  if (!eventRoot?.addEventListener || !ownerDocument?.addEventListener) {
+    return () => {};
+  }
+
+  eventRoot.addEventListener("pointerdown", listener, capture);
+  if (eventRoot === ownerDocument || !eventRoot.host) {
+    return () => eventRoot.removeEventListener("pointerdown", listener, capture);
+  }
+
+  // Events originating in a closed shadow tree are retargeted to its host for
+  // document listeners. Let the ShadowRoot listener classify those clicks;
+  // the document listener exists only for genuine host-page clicks, which do
+  // not enter the ShadowRoot event path at all.
+  const listenOnHostPage = (event) => {
+    if (event.composedPath?.().includes(eventRoot.host)) return;
+    listener(event);
+  };
+  ownerDocument.addEventListener("pointerdown", listenOnHostPage, capture);
+  return () => {
+    eventRoot.removeEventListener("pointerdown", listener, capture);
+    ownerDocument.removeEventListener(
+      "pointerdown",
+      listenOnHostPage,
+      capture,
+    );
+  };
 }
 
 function getPhraseRange(phrase, sentence) {
@@ -428,6 +506,7 @@ function PhraseText({
         <button
           aria-label={`查看批注 ${annotation.annotationNumber}`}
           className="annotation-inline-marker"
+          data-selection-ignore=""
           key={`annotation-${annotation.id}`}
           onClick={(event) => onAnnotationActivate?.(event, annotation)}
           title={`批注 ${annotation.annotationNumber}`}
@@ -440,6 +519,147 @@ function PhraseText({
   }
   return parts;
 }
+
+const TranscriptRow = memo(function TranscriptRow({
+  annotations,
+  copied,
+  isActive,
+  onCopy,
+  onOpenAnnotations,
+  onPhraseActivate,
+  onPhraseEnter,
+  onPhraseFocus,
+  onPhraseLeave,
+  onPlay,
+  onStartNote,
+  phrases,
+  savedPhraseIds,
+  sentence,
+  showPhrases,
+}) {
+  return (
+    <article
+      className={`transcript-row${isActive ? " is-active" : ""}`}
+      data-sentence-id={sentence.id}
+    >
+      <button
+        aria-label={`从 ${formatTime(sentence.startMs)} 开始播放`}
+        className="transcript-row__time"
+        onClick={() => onPlay(sentence)}
+        title="从这里播放"
+        type="button"
+      >
+        <IconPlayerPlayFilled aria-hidden="true" size={11} />
+        {formatTime(sentence.startMs)}
+      </button>
+      <p className="transcript-row__text" data-sentence-text="">
+        <PhraseText
+          annotations={annotations}
+          onAnnotationActivate={(event, annotation) =>
+            onOpenAnnotations(
+              event.currentTarget,
+              sentence.id,
+              annotation.id,
+            )
+          }
+          onPhraseActivate={onPhraseActivate}
+          onPhraseEnter={onPhraseEnter}
+          onPhraseFocus={onPhraseFocus}
+          onPhraseLeave={onPhraseLeave}
+          phrases={phrases}
+          savedPhraseIds={savedPhraseIds}
+          sentence={sentence}
+          showPhrases={showPhrases}
+        />
+      </p>
+      <div className="transcript-row__actions">
+        <button
+          aria-label={`${formatTime(sentence.startMs)} 复制整句`}
+          className={`transcript-row__copy${copied ? " is-copied" : ""}`}
+          onClick={() => onCopy(sentence)}
+          title="复制整句"
+          type="button"
+        >
+          {copied ? (
+            <IconCheck aria-hidden="true" size={15} />
+          ) : (
+            <IconCopy aria-hidden="true" size={15} />
+          )}
+          <span className="transcript-row__action-label">
+            {copied ? "已复制" : "复制"}
+          </span>
+        </button>
+        <button
+          aria-label={
+            annotations.length
+              ? `${annotations.length} 条批注`
+              : "添加整句批注"
+          }
+          className={annotations.length ? "has-count" : ""}
+          onClick={(event) => {
+            if (annotations.length) {
+              onOpenAnnotations(event.currentTarget, sentence.id);
+            } else {
+              onStartNote(sentence, event.currentTarget);
+            }
+          }}
+          title={annotations.length ? "查看批注" : "添加整句批注"}
+          type="button"
+        >
+          <IconMessageCircle aria-hidden="true" size={15} />
+          {annotations.length > 0 && (
+            <span className="transcript-row__count">{annotations.length}</span>
+          )}
+        </button>
+      </div>
+    </article>
+  );
+});
+
+const TranscriptStream = memo(function TranscriptStream({
+  activeSentenceId,
+  annotationsBySentence,
+  copiedSentenceId,
+  onCopy,
+  onOpenAnnotations,
+  onPhraseActivate,
+  onPhraseEnter,
+  onPhraseFocus,
+  onPhraseLeave,
+  onPlay,
+  onStartNote,
+  phrasesBySentence,
+  savedPhraseIds,
+  sentences,
+  showPhrases,
+}) {
+  return (
+    <section className="transcript-stream">
+      {sentences.map((sentence) => (
+        <TranscriptRow
+          annotations={
+            annotationsBySentence.get(sentence.id) ?? EMPTY_LIST
+          }
+          copied={copiedSentenceId === sentence.id}
+          isActive={sentence.id === activeSentenceId}
+          key={sentence.id}
+          onCopy={onCopy}
+          onOpenAnnotations={onOpenAnnotations}
+          onPhraseActivate={onPhraseActivate}
+          onPhraseEnter={onPhraseEnter}
+          onPhraseFocus={onPhraseFocus}
+          onPhraseLeave={onPhraseLeave}
+          onPlay={onPlay}
+          onStartNote={onStartNote}
+          phrases={phrasesBySentence.get(sentence.id) ?? EMPTY_LIST}
+          savedPhraseIds={savedPhraseIds}
+          sentence={sentence}
+          showPhrases={showPhrases}
+        />
+      ))}
+    </section>
+  );
+});
 
 function AnnotationCard({ annotation, onDelete }) {
   const meta = KIND_META[annotation.kind] ?? KIND_META.note;
@@ -616,7 +836,7 @@ function ThreadCard({
 
 function PhraseTooltip({ active, onEnter, onLeave, onSave, saved }) {
   if (!active) return null;
-  const { phrase, left, top } = active;
+  const { phrase, left, top, width } = active;
   const canonical = phrase.canonical ?? phrase.phrase ?? phrase.exact;
   const showSurface =
     canonical &&
@@ -629,7 +849,7 @@ function PhraseTooltip({ active, onEnter, onLeave, onSave, saved }) {
       className="phrase-tooltip"
       onMouseEnter={onEnter}
       onMouseLeave={onLeave}
-      style={{ left, top }}
+      style={{ left, top, width }}
     >
       <div className="phrase-tooltip__eyebrow">
         <span>{phrase.category ?? "重点表达"}</span>
@@ -663,8 +883,12 @@ function SelectionToolbar({ selection, onAddComment, onCopySelection }) {
     <div
       aria-label="选中文本操作"
       className="selection-toolbar"
-      role="toolbar"
-      style={{ left: selection.left, top: selection.top }}
+      role="group"
+      style={{
+        left: selection.left,
+        maxWidth: selection.toolbarMaxWidth,
+        top: selection.top,
+      }}
     >
       <button
         className="selection-toolbar__copy"
@@ -691,21 +915,35 @@ function CommentPopover({ draft, onCancel, onChange, onSave }) {
       aria-label="添加批注"
       className="comment-popover"
       role="dialog"
-      style={{ left: draft.editorLeft, top: draft.editorTop }}
+      style={{
+        left: draft.editorLeft,
+        top: draft.editorTop,
+        width: draft.editorWidth,
+      }}
     >
       <textarea
         aria-label="批注内容"
         autoFocus
         onChange={(event) => onChange(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === "Escape") onCancel();
+          const composing =
+            event.isComposing ||
+            event.nativeEvent?.isComposing ||
+            event.keyCode === 229;
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            onCancel();
+            return;
+          }
           if (
-            (event.metaKey || event.ctrlKey) &&
             event.key === "Enter" &&
-            canSave
+            !event.shiftKey &&
+            !composing
           ) {
             event.preventDefault();
-            onSave();
+            event.stopPropagation();
+            if (canSave) onSave();
           }
         }}
         placeholder="添加批注…"
@@ -753,7 +991,7 @@ function ThreadEditorPopover({
       aria-label="编辑批注"
       className="comment-popover thread-editor-popover"
       role="dialog"
-      style={{ left: editor.left, top: editor.top }}
+      style={{ left: editor.left, top: editor.top, width: editor.width }}
     >
       {editor.threads.length > 1 && (
         <nav aria-label="选择批注" className="thread-editor-popover__tabs">
@@ -775,14 +1013,24 @@ function ThreadEditorPopover({
         autoFocus
         onChange={(event) => onChange(event.target.value)}
         onKeyDown={(event) => {
-          if (event.key === "Escape") onCancel();
+          const composing =
+            event.isComposing ||
+            event.nativeEvent?.isComposing ||
+            event.keyCode === 229;
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            onCancel();
+            return;
+          }
           if (
-            (event.metaKey || event.ctrlKey) &&
             event.key === "Enter" &&
-            canSave
+            !event.shiftKey &&
+            !composing
           ) {
             event.preventDefault();
-            onSave();
+            event.stopPropagation();
+            if (canSave) onSave();
           }
         }}
         placeholder="添加可选评论…"
@@ -972,6 +1220,10 @@ export function App({ embedded = false, onCollapse = null }) {
   const hydratedDocumentIdRef = useRef(null);
   const renderedDocumentIdRef = useRef(null);
   const panelHoveredRef = useRef(false);
+  const captionFollowModeRef = useRef(CAPTION_FOLLOW_MODE.FOLLOWING);
+  const captionFollowInteractionBlockedRef = useRef(false);
+  const captionFollowIdleTimerRef = useRef(null);
+  const captionFollowFocusTimerRef = useRef(null);
   const programmaticScrollRef = useRef(false);
   const programmaticScrollTimerRef = useRef(null);
   const pointerScrollingRef = useRef(false);
@@ -986,46 +1238,116 @@ export function App({ embedded = false, onCollapse = null }) {
         ? "dark"
         : "light"
       : themeMode;
-
-  const applyThemeMode = useCallback(
-    (nextMode) => {
-      const normalizedMode = normalizeThemeMode(nextMode);
-      const nextTheme =
-        normalizedMode === "system"
-          ? systemPrefersDark
-            ? "dark"
-            : "light"
-          : normalizedMode;
-      const stage = stageRef.current;
-      const host = stage?.getRootNode?.()?.host;
-      const targets = [stage, host].filter(Boolean);
-
-      window.cancelAnimationFrame(themeFrameRef.current);
-      targets.forEach((target) => {
-        target.dataset.themeChanging = "true";
-        target.dataset.theme = nextTheme;
-        target.dataset.themeMode = normalizedMode;
-      });
-      themeFrameRef.current = window.requestAnimationFrame(() => {
-        themeFrameRef.current = window.requestAnimationFrame(() => {
-          targets.forEach((target) => {
-            delete target.dataset.themeChanging;
-          });
-        });
-      });
-
-      startTransition(() => {
-        setThemeMode(normalizedMode);
-      });
-    },
-    [systemPrefersDark],
+  const captionFollowInteractionBlocked = Boolean(
+    activeTab !== "transcript" ||
+      selection ||
+      draft ||
+      threadEditor ||
+      menuOpen ||
+      searchOpen ||
+      searchTerm ||
+      activePhrase ||
+      expandedSentenceId
   );
+  captionFollowModeRef.current = captionFollowMode;
+  captionFollowInteractionBlockedRef.current =
+    captionFollowInteractionBlocked;
+
+  const applyThemeMode = useCallback((nextMode) => {
+    const normalizedMode = normalizeThemeMode(nextMode);
+    startTransition(() => {
+      setThemeMode(normalizedMode);
+    });
+  }, []);
 
   const transitionCaptionFollow = useCallback((event) => {
     setCaptionFollowMode((current) =>
       transitionCaptionFollowMode(current, event),
     );
   }, []);
+
+  const clearCaptionFollowIdleTimer = useCallback(() => {
+    window.clearTimeout(captionFollowIdleTimerRef.current);
+    captionFollowIdleTimerRef.current = null;
+  }, []);
+
+  const captionFollowFocusIsBlocked = useCallback(() => {
+    const stage = stageRef.current;
+    const root = stage?.getRootNode?.();
+    const activeElement =
+      root?.activeElement ?? stage?.ownerDocument?.activeElement ?? null;
+    if (!stage || !activeElement || !stage.contains(activeElement)) {
+      return false;
+    }
+    return Boolean(
+      activeElement.closest?.(
+        "input, textarea, select, [contenteditable='true'], .overflow-menu, .search-field, .comment-popover",
+      ),
+    );
+  }, []);
+
+  const scheduleCaptionFollowIdleResume = useCallback(() => {
+    clearCaptionFollowIdleTimer();
+    if (
+      !shouldResumeCaptionFollowAfterIdle({
+        mode: captionFollowModeRef.current,
+        pointerInside: panelHoveredRef.current,
+        focusBlocked: captionFollowFocusIsBlocked(),
+        interactionBlocked: captionFollowInteractionBlockedRef.current,
+      })
+    ) {
+      return;
+    }
+    captionFollowIdleTimerRef.current = window.setTimeout(() => {
+      captionFollowIdleTimerRef.current = null;
+      if (
+        !shouldResumeCaptionFollowAfterIdle({
+          mode: captionFollowModeRef.current,
+          pointerInside: panelHoveredRef.current,
+          focusBlocked: captionFollowFocusIsBlocked(),
+          interactionBlocked: captionFollowInteractionBlockedRef.current,
+        })
+      ) {
+        return;
+      }
+      setCaptionFollowMode((current) => {
+        if (
+          !shouldResumeCaptionFollowAfterIdle({
+            mode: current,
+            pointerInside: panelHoveredRef.current,
+            focusBlocked: captionFollowFocusIsBlocked(),
+            interactionBlocked: captionFollowInteractionBlockedRef.current,
+          })
+        ) {
+          return current;
+        }
+        return transitionCaptionFollowMode(current, {
+          type: CAPTION_FOLLOW_EVENT.RESUME,
+        });
+      });
+    }, CAPTION_FOLLOW_IDLE_MS);
+  }, [captionFollowFocusIsBlocked, clearCaptionFollowIdleTimer]);
+
+  const restartCaptionFollowIdleWindow = useCallback(() => {
+    clearCaptionFollowIdleTimer();
+    scheduleCaptionFollowIdleResume();
+  }, [clearCaptionFollowIdleTimer, scheduleCaptionFollowIdleResume]);
+
+  useEffect(() => {
+    if (
+      captionFollowMode === CAPTION_FOLLOW_MODE.MANUAL &&
+      !captionFollowInteractionBlocked
+    ) {
+      scheduleCaptionFollowIdleResume();
+    } else {
+      clearCaptionFollowIdleTimer();
+    }
+  }, [
+    captionFollowInteractionBlocked,
+    captionFollowMode,
+    clearCaptionFollowIdleTimer,
+    scheduleCaptionFollowIdleResume,
+  ]);
 
   const pauseCaptionFollowForUser = useCallback(() => {
     programmaticScrollRef.current = false;
@@ -1060,10 +1382,12 @@ export function App({ embedded = false, onCollapse = null }) {
             settings.includeAllCandidates === true,
         );
         setThemeMode(normalizeThemeMode(settings.theme));
+        setSettingsReady(true);
       })
-      .catch(() => {})
-      .finally(() => {
-        if (!cancelled) setSettingsReady(true);
+      .catch(() => {
+        if (cancelled) return;
+        setSettingsReady(false);
+        setToast("设置读取失败，已暂停写入以保护现有数据");
       });
     return () => {
       cancelled = true;
@@ -1080,7 +1404,7 @@ export function App({ embedded = false, onCollapse = null }) {
         theme: themeMode,
         includeAllCandidatesOnExport: includeAllCandidates,
       }),
-    ).catch(() => {});
+    ).catch(() => setToast("设置保存失败，请重试"));
   }, [
     includeAllCandidates,
     settingsReady,
@@ -1097,17 +1421,39 @@ export function App({ embedded = false, onCollapse = null }) {
     return () => mediaQuery.removeEventListener("change", syncSystemTheme);
   }, []);
 
-  useEffect(() => {
-    const host = transcriptRef.current?.getRootNode?.()?.host;
-    if (!host) return;
-    host.dataset.theme = resolvedTheme;
-    host.dataset.themeMode = themeMode;
+  useLayoutEffect(() => {
+    const stage = stageRef.current;
+    const host = stage?.getRootNode?.()?.host;
+    const targets = [stage, host].filter(Boolean);
+    if (!targets.length) return undefined;
+
+    window.cancelAnimationFrame(themeFrameRef.current);
+    targets.forEach((target) => {
+      target.dataset.themeChanging = "true";
+      target.dataset.theme = resolvedTheme;
+      target.dataset.themeMode = themeMode;
+    });
+    themeFrameRef.current = window.requestAnimationFrame(() => {
+      themeFrameRef.current = window.requestAnimationFrame(() => {
+        targets.forEach((target) => {
+          delete target.dataset.themeChanging;
+        });
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(themeFrameRef.current);
+      targets.forEach((target) => {
+        delete target.dataset.themeChanging;
+      });
+    };
   }, [resolvedTheme, themeMode]);
 
   useEffect(() => {
     let cancelled = false;
     Promise.all([
-      loadPhraseAnalysisCache(document, PHRASE_ANALYZER_VERSION),
+      RUNTIME_BUILD.isExtension
+        ? Promise.resolve(null)
+        : loadPhraseAnalysisCache(document, PHRASE_ANALYZER_VERSION),
       loadPhraseFeedback(),
     ])
       .then(([cached, feedback]) => {
@@ -1118,13 +1464,15 @@ export function App({ embedded = false, onCollapse = null }) {
         }
         const candidates = detectPhrases(document.sentences, { feedback });
         setPhrases(candidates);
-        Promise.resolve(
-          savePhraseAnalysisCache(
-            document,
-            PHRASE_ANALYZER_VERSION,
-            candidates,
-          ),
-        ).catch(() => {});
+        if (!RUNTIME_BUILD.isExtension) {
+          Promise.resolve(
+            savePhraseAnalysisCache(
+              document,
+              PHRASE_ANALYZER_VERSION,
+              candidates,
+            ),
+          ).catch(() => {});
+        }
       })
       .catch(() => {
         if (!cancelled) setPhrases(detectPhrases(document.sentences));
@@ -1156,6 +1504,13 @@ export function App({ embedded = false, onCollapse = null }) {
   useEffect(() => {
     hydratedDocumentIdRef.current = null;
     setStorageReady(false);
+    setAnnotationThreads([]);
+    setSavedPhrases([]);
+    setSelection(null);
+    setDraft(null);
+    setThreadEditor(null);
+    setActivePhrase(null);
+    clearTextSelection(transcriptRef.current);
     let cancelled = false;
     Promise.all([
       loadAnnotationThreads(document.id),
@@ -1168,15 +1523,15 @@ export function App({ embedded = false, onCollapse = null }) {
           Array.isArray(phrasesForDocument) ? phrasesForDocument : [],
         );
         hydratedDocumentIdRef.current = document.id;
+        setStorageReady(true);
       })
       .catch(() => {
         if (cancelled) return;
         setAnnotationThreads([]);
         setSavedPhrases([]);
-        hydratedDocumentIdRef.current = document.id;
-      })
-      .finally(() => {
-        if (!cancelled) setStorageReady(true);
+        hydratedDocumentIdRef.current = null;
+        setStorageReady(false);
+        setToast("学习记录读取失败，已暂停写入以保护现有数据");
       });
     return () => {
       cancelled = true;
@@ -1192,7 +1547,7 @@ export function App({ embedded = false, onCollapse = null }) {
     }
     Promise.resolve(
       saveAnnotationThreads(annotationThreads, document.id),
-    ).catch(() => {});
+    ).catch(() => setToast("批注保存失败，请检查扩展存储空间"));
   }, [annotationThreads, document.id, storageReady]);
 
   useEffect(() => {
@@ -1202,11 +1557,18 @@ export function App({ embedded = false, onCollapse = null }) {
     ) {
       return;
     }
-    Promise.resolve(saveSavedPhrases(savedPhrases, document.id)).catch(() => {});
+    Promise.resolve(saveSavedPhrases(savedPhrases, document.id)).catch(() => {
+      setToast("学习单保存失败，请检查扩展存储空间");
+    });
   }, [document.id, savedPhrases, storageReady]);
 
   useEffect(() => {
-    if (document.source?.provider === "demo") return;
+    if (
+      RUNTIME_BUILD.isExtension ||
+      document.source?.provider === "demo"
+    ) {
+      return;
+    }
     Promise.resolve(saveCaptionDocument(document)).catch(() => {});
   }, [document]);
 
@@ -1220,6 +1582,10 @@ export function App({ embedded = false, onCollapse = null }) {
     }
 
     const nextDocument = createPageCaptionDocument(captionBridge.document);
+    hydratedDocumentIdRef.current = null;
+    setStorageReady(false);
+    setAnnotationThreads([]);
+    setSavedPhrases([]);
     setDocument(nextDocument);
     setPhrases(detectPhrases(nextDocument.sentences));
     setActiveTab("transcript");
@@ -1244,25 +1610,30 @@ export function App({ embedded = false, onCollapse = null }) {
 
   useEffect(() => {
     if (!menuOpen) return undefined;
-    const eventRoot = menuRef.current?.getRootNode?.() ?? globalThis.document;
     const closeMenu = (event) => {
       if (!menuRef.current?.contains(event.target)) setMenuOpen(false);
     };
-    eventRoot.addEventListener("pointerdown", closeMenu);
-    return () => eventRoot.removeEventListener("pointerdown", closeMenu);
+    return listenForShadowAwarePointerDown(menuRef.current, closeMenu);
   }, [menuOpen]);
 
+  const hasFloatingDraft = Boolean(draft?.floating);
+  const hasActivePhrase = Boolean(activePhrase);
+  const hasThreadEditor = Boolean(threadEditor);
+  const hasTextSelection = Boolean(selection);
+
   useEffect(() => {
-    if (!draft?.floating && !threadEditor) return undefined;
-    const eventRoot = transcriptRef.current?.getRootNode?.() ??
-      globalThis.document;
+    if (!hasFloatingDraft && !hasThreadEditor && !hasTextSelection) {
+      return undefined;
+    }
     const closeOnOutsidePointer = (event) => {
       const path = event.composedPath?.() ?? [event.target];
       const insideEditor = path.some(
         (node) =>
           node instanceof Element &&
           (node.matches?.(".comment-popover") ||
-            node.closest?.(".comment-popover")),
+            node.closest?.(".comment-popover") ||
+            node.matches?.(".selection-toolbar") ||
+            node.closest?.(".selection-toolbar")),
       );
       if (insideEditor) return;
       setDraft(null);
@@ -1270,10 +1641,138 @@ export function App({ embedded = false, onCollapse = null }) {
       setSelection(null);
       clearTextSelection(transcriptRef.current);
     };
-    eventRoot.addEventListener("pointerdown", closeOnOutsidePointer, true);
-    return () =>
-      eventRoot.removeEventListener("pointerdown", closeOnOutsidePointer, true);
-  }, [draft?.floating, threadEditor]);
+    return listenForShadowAwarePointerDown(
+      transcriptRef.current,
+      closeOnOutsidePointer,
+      true,
+    );
+  }, [hasFloatingDraft, hasTextSelection, hasThreadEditor]);
+
+  useEffect(() => {
+    if (
+      !hasActivePhrase &&
+      !hasFloatingDraft &&
+      !hasThreadEditor &&
+      !hasTextSelection
+    ) {
+      return undefined;
+    }
+    const stage = stageRef.current;
+    const ResizeObserverApi = globalThis.ResizeObserver;
+    if (!stage || !ResizeObserverApi) return undefined;
+
+    let frame = 0;
+    let lastWidth = stage.clientWidth;
+    let lastHeight = stage.clientHeight;
+    const clampValue = (value, minimum, maximum) =>
+      Math.max(minimum, Math.min(Number(value) || minimum, maximum));
+    const clampFloaters = () => {
+      frame = 0;
+      const width = stage.clientWidth;
+      const height = stage.clientHeight;
+      const stageResized = width !== lastWidth || height !== lastHeight;
+      lastWidth = width;
+      lastHeight = height;
+      if (stageResized) {
+        // Selection and phrase anchors are DOM ranges. Once text reflows their
+        // cached rectangles are invalid; closing these transient surfaces is
+        // safer than leaving controls detached from the selected text.
+        setActivePhrase(null);
+        setSelection(null);
+        clearTextSelection(transcriptRef.current);
+      }
+      const clampPosition = (
+        current,
+        itemWidth,
+        itemHeight,
+        {
+          leftKey = "left",
+          topKey = "top",
+          widthKey = "width",
+        } = {},
+      ) => {
+        if (!current) return current;
+        const resolvedWidth = Math.min(
+          itemWidth,
+          Math.max(0, width - 16),
+        );
+        const left = clampValue(
+          current[leftKey],
+          8,
+          Math.max(8, width - resolvedWidth - 8),
+        );
+        const top = clampValue(
+          current[topKey],
+          8,
+          Math.max(8, height - itemHeight - 8),
+        );
+        if (
+          current[leftKey] === left &&
+          current[topKey] === top &&
+          current[widthKey] === resolvedWidth
+        ) {
+          return current;
+        }
+        return {
+          ...current,
+          [leftKey]: left,
+          [topKey]: top,
+          [widthKey]: resolvedWidth,
+        };
+      };
+      setActivePhrase((current) =>
+        clampPosition(current, current?.width ?? 274, 240),
+      );
+      setSelection((current) => {
+        const toolbar = clampPosition(
+          current,
+          current?.toolbarMaxWidth ?? 230,
+          42,
+          { widthKey: "toolbarMaxWidth" },
+        );
+        return clampPosition(
+          toolbar,
+          toolbar?.editorWidth ?? 340,
+          164,
+          {
+            leftKey: "editorLeft",
+            topKey: "editorTop",
+            widthKey: "editorWidth",
+          },
+        );
+      });
+      setDraft((current) =>
+        current?.floating
+          ? clampPosition(current, current.editorWidth ?? 340, 164, {
+              leftKey: "editorLeft",
+              topKey: "editorTop",
+              widthKey: "editorWidth",
+            })
+          : current,
+      );
+      setThreadEditor((current) =>
+        clampPosition(current, current?.width ?? 316, 190),
+      );
+    };
+    const scheduleClamp = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(clampFloaters);
+    };
+    const observer = new ResizeObserverApi(scheduleClamp);
+    observer.observe(stage);
+    window.addEventListener("resize", scheduleClamp, { passive: true });
+    scheduleClamp();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", scheduleClamp);
+      window.cancelAnimationFrame(frame);
+    };
+  }, [
+    hasActivePhrase,
+    hasFloatingDraft,
+    hasTextSelection,
+    hasThreadEditor,
+  ]);
 
   const savedPhraseIds = useMemo(
     () =>
@@ -1327,22 +1826,56 @@ export function App({ embedded = false, onCollapse = null }) {
 
   const documentMediaId =
     document.caption?.mediaBinding?.mediaId || document.source?.mediaId || "";
+  const documentProvider =
+    document.caption?.mediaBinding?.provider || "";
+  const liveMediaId = media.mediaId || "";
+  const liveProvider = media.provider || "";
   const bridgeMediaId = captionBridge.state?.mediaBinding?.mediaId || "";
-  const bridgeStillMatchesDocument = Boolean(
-    documentMediaId && bridgeMediaId && documentMediaId === bridgeMediaId,
+  const bridgeProvider = captionBridge.state?.mediaBinding?.provider || "";
+  const bindingMatchesDocument = (mediaId, provider) =>
+    !mediaId ||
+    (documentMediaId === mediaId &&
+      (!documentProvider || !provider || documentProvider === provider));
+  // Keep the last successful document during a same-media refresh failure,
+  // but hide it as soon as either bridge reports a different active video.
+  const activeMediaMatchesDocument = Boolean(
+    documentMediaId &&
+      (liveMediaId || bridgeMediaId) &&
+      bindingMatchesDocument(liveMediaId, liveProvider) &&
+      bindingMatchesDocument(bridgeMediaId, bridgeProvider),
   );
   const currentCaptionReady =
     !RUNTIME_BUILD.isExtension ||
-    (captionBridge.status === CAPTION_STATUS.READY &&
-      captionBridge.document?.id === document.id) ||
-    (captionBridge.status === CAPTION_STATUS.LOADING &&
-      bridgeStillMatchesDocument);
+    activeMediaMatchesDocument;
   const renderedSentences = currentCaptionReady ? visibleSentences : [];
   const waitingForCurrentCaption =
     RUNTIME_BUILD.isExtension &&
+    !currentCaptionReady &&
     [CAPTION_STATUS.IDLE, CAPTION_STATUS.LOADING].includes(
       captionBridge.status,
     );
+
+  useEffect(() => {
+    if (currentCaptionReady) return;
+    setActiveTab("transcript");
+    setSelection(null);
+    setDraft(null);
+    setThreadEditor(null);
+    setActivePhrase(null);
+    clearTextSelection(transcriptRef.current);
+  }, [currentCaptionReady]);
+
+  const learningRecordsReady = Boolean(
+    currentCaptionReady &&
+      storageReady &&
+      hydratedDocumentIdRef.current === document.id,
+  );
+
+  const requireLearningRecords = () => {
+    if (learningRecordsReady) return true;
+    setToast("学习记录尚未加载完成，请稍后再试");
+    return false;
+  };
 
   useEffect(() => {
     if (!currentCaptionReady || !document.id) return;
@@ -1363,15 +1896,10 @@ export function App({ embedded = false, onCollapse = null }) {
   }, [document.id, transitionCaptionFollow]);
 
   const activeSentence = useMemo(() => {
+    if (!currentCaptionReady) return null;
     const currentMs = media.currentTime * 1000;
-    return document.sentences.find(
-      (sentence) =>
-        currentMs >= sentence.startMs &&
-        currentMs <
-          (sentence.endMs ??
-            sentence.startMs + Math.max(sentence.text.length * 70, 2000)),
-    );
-  }, [document.sentences, media.currentTime]);
+    return findActiveSentence(document.sentences, currentMs);
+  }, [currentCaptionReady, document.sentences, media.currentTime]);
   const activeSentenceId = activeSentence?.id ?? null;
 
   useEffect(() => {
@@ -1412,8 +1940,12 @@ export function App({ embedded = false, onCollapse = null }) {
 
   useEffect(
     () => () => {
+      window.clearTimeout(captionFollowIdleTimerRef.current);
+      window.clearTimeout(captionFollowFocusTimerRef.current);
       window.clearTimeout(seekSettleTimerRef.current);
       window.clearTimeout(programmaticScrollTimerRef.current);
+      window.clearTimeout(phraseCloseTimerRef.current);
+      window.clearTimeout(copyResetTimerRef.current);
       window.cancelAnimationFrame(themeFrameRef.current);
     },
     [],
@@ -1423,16 +1955,10 @@ export function App({ embedded = false, onCollapse = null }) {
     if (activeTab !== "transcript") return undefined;
     const container = transcriptRef.current;
     if (!container) return undefined;
-    const scrollKeys = new Set([
-      "ArrowUp",
-      "ArrowDown",
-      "PageUp",
-      "PageDown",
-      "Home",
-      "End",
-      " ",
-    ]);
-    const markManual = () => pauseCaptionFollowForUser();
+    const markManual = () => {
+      pauseCaptionFollowForUser();
+      restartCaptionFollowIdleWindow();
+    };
     const handlePointerDown = (event) => {
       pointerScrollingRef.current = true;
       if (event.target === container) {
@@ -1443,7 +1969,13 @@ export function App({ embedded = false, onCollapse = null }) {
       pointerScrollingRef.current = false;
     };
     const handleScroll = () => {
-      if (programmaticScrollRef.current) return;
+      if (programmaticScrollRef.current) {
+        setActivePhrase(null);
+        return;
+      }
+      setActivePhrase(null);
+      setSelection(null);
+      clearTextSelection(container);
       if (pointerScrollingRef.current) markManual();
     };
     const handleScrollEnd = () => {
@@ -1454,11 +1986,12 @@ export function App({ embedded = false, onCollapse = null }) {
       if (event.target.closest?.("button, input, textarea, select, [contenteditable]")) {
         return;
       }
-      if (scrollKeys.has(event.key)) markManual();
+      if (CAPTION_FOLLOW_SCROLL_KEYS.has(event.key)) markManual();
     };
     const eventRoot = container.getRootNode?.() ?? globalThis.document;
 
     container.addEventListener("wheel", markManual, { passive: true });
+    container.addEventListener("touchstart", markManual, { passive: true });
     container.addEventListener("touchmove", markManual, { passive: true });
     container.addEventListener("pointerdown", handlePointerDown, { passive: true });
     container.addEventListener("scroll", handleScroll, { passive: true });
@@ -1469,6 +2002,7 @@ export function App({ embedded = false, onCollapse = null }) {
 
     return () => {
       container.removeEventListener("wheel", markManual);
+      container.removeEventListener("touchstart", markManual);
       container.removeEventListener("touchmove", markManual);
       container.removeEventListener("pointerdown", handlePointerDown);
       container.removeEventListener("scroll", handleScroll);
@@ -1477,18 +2011,30 @@ export function App({ embedded = false, onCollapse = null }) {
       eventRoot.removeEventListener("pointerup", handlePointerUp);
       eventRoot.removeEventListener("pointercancel", handlePointerUp);
     };
-  }, [activeTab, pauseCaptionFollowForUser]);
+  }, [
+    activeTab,
+    pauseCaptionFollowForUser,
+    restartCaptionFollowIdleWindow,
+  ]);
 
   const scrollSentenceToFollowPosition = useCallback(
     (sentenceId, behavior = "smooth") => {
       const container = transcriptRef.current;
       if (!container || !sentenceId) return false;
-      const row = Array.from(
-        container.querySelectorAll("[data-sentence-id]"),
-      ).find((element) => element.dataset.sentenceId === sentenceId);
+      const escapedSentenceId = globalThis.CSS?.escape
+        ? globalThis.CSS.escape(String(sentenceId))
+        : String(sentenceId).replace(/["\\]/g, "\\$&");
+      const row = container.querySelector(
+        `[data-sentence-id="${escapedSentenceId}"]`,
+      );
       if (!row) return false;
       const containerRect = container.getBoundingClientRect();
       const rowRect = row.getBoundingClientRect();
+      const resolvedBehavior = globalThis.matchMedia?.(
+        "(prefers-reduced-motion: reduce)",
+      )?.matches
+        ? "auto"
+        : behavior;
       const targetTop =
         container.scrollTop +
         (rowRect.top - containerRect.top) -
@@ -1497,11 +2043,11 @@ export function App({ embedded = false, onCollapse = null }) {
       window.clearTimeout(programmaticScrollTimerRef.current);
       container.scrollTo({
         top: Math.max(0, targetTop),
-        behavior,
+        behavior: resolvedBehavior,
       });
       programmaticScrollTimerRef.current = window.setTimeout(() => {
         programmaticScrollRef.current = false;
-      }, behavior === "smooth" ? 900 : 120);
+      }, resolvedBehavior === "smooth" ? 900 : 120);
       return true;
     },
     [],
@@ -1539,7 +2085,7 @@ export function App({ embedded = false, onCollapse = null }) {
   );
 
   const locateCurrentCaption = useCallback(() => {
-    if (!document.sentences.length) return;
+    if (!currentCaptionReady || !document.sentences.length) return;
     transitionCaptionFollow({ type: CAPTION_FOLLOW_EVENT.RESUME });
     const currentMs = media.currentTime * 1000;
     const exact = document.sentences.find(
@@ -1571,6 +2117,7 @@ export function App({ embedded = false, onCollapse = null }) {
       });
     });
   }, [
+    currentCaptionReady,
     document.sentences,
     media.currentTime,
     scrollSentenceToFollowPosition,
@@ -1578,12 +2125,16 @@ export function App({ embedded = false, onCollapse = null }) {
   ]);
 
   const focusedSentence = useMemo(
-    () =>
-      visibleSentences.find((sentence) => sentence.id === activeSentenceId) ??
-      visibleSentences[0] ??
-      document.sentences[0] ??
-      null,
-    [activeSentenceId, document.sentences, visibleSentences],
+    () => {
+      if (!currentCaptionReady) return null;
+      return (
+        visibleSentences.find((sentence) => sentence.id === activeSentenceId) ??
+        visibleSentences[0] ??
+        document.sentences[0] ??
+        null
+      );
+    },
+    [activeSentenceId, currentCaptionReady, document.sentences, visibleSentences],
   );
 
   const floatingDraft = Boolean(draft?.floating);
@@ -1599,18 +2150,29 @@ export function App({ embedded = false, onCollapse = null }) {
   const drawerOpen = false;
   const handlePhraseEnter = (event, phrase) => {
     window.clearTimeout(phraseCloseTimerRef.current);
-    const rect = event.currentTarget.getBoundingClientRect();
-    const panelRect = transcriptRef.current
-      ?.closest(".caption-panel")
-      ?.getBoundingClientRect();
+    const stageRect = stageRef.current?.getBoundingClientRect();
+    const rect = rectRelativeTo(
+      event.currentTarget.getBoundingClientRect(),
+      stageRect,
+    );
+    const panelRect = rectRelativeTo(
+      transcriptRef.current
+        ?.closest(".caption-panel")
+        ?.getBoundingClientRect(),
+      stageRect,
+    );
     const leftBoundary = panelRect?.left ?? 0;
     const rightBoundary = panelRect?.right ?? window.innerWidth;
     const topBoundary = panelRect?.top ?? 0;
     const bottomBoundary = panelRect?.bottom ?? window.innerHeight;
-    const tooltipWidth = 274;
-    const tooltipHeight = 158;
+    const tooltipWidth = Math.min(
+      274,
+      Math.max(180, rightBoundary - leftBoundary - 24),
+    );
+    const tooltipHeight = 240;
     setActivePhrase({
       phrase,
+      width: tooltipWidth,
       left: Math.max(
         leftBoundary + 12,
         Math.min(rect.left, rightBoundary - tooltipWidth - 12),
@@ -1662,6 +2224,8 @@ export function App({ embedded = false, onCollapse = null }) {
     if (
       !sentenceElement ||
       sentenceElement !== endSentenceElement ||
+      startElement?.closest?.("[data-selection-ignore]") ||
+      endElement?.closest?.("[data-selection-ignore]") ||
       !transcriptRef.current?.contains(sentenceElement)
     ) {
       setSelection(null);
@@ -1690,8 +2254,8 @@ export function App({ embedded = false, onCollapse = null }) {
     const endRange = globalThis.document.createRange();
     endRange.selectNodeContents(textRoot);
     endRange.setEnd(range.endContainer, range.endOffset);
-    let charStart = startRange.toString().length;
-    let charEnd = endRange.toString().length;
+    let charStart = rangeTextLengthIgnoringUi(startRange);
+    let charEnd = rangeTextLengthIgnoringUi(endRange);
     let exact = sentence.text.slice(charStart, charEnd);
     const leading = exact.length - exact.trimStart().length;
     const trailing = exact.length - exact.trimEnd().length;
@@ -1703,14 +2267,21 @@ export function App({ embedded = false, onCollapse = null }) {
       return;
     }
 
-    const rect = range.getBoundingClientRect();
-    const panelRect = transcriptRef.current
-      ?.closest(".caption-panel")
-      ?.getBoundingClientRect();
+    const stageRect = stageRef.current?.getBoundingClientRect();
+    const rect = rectRelativeTo(range.getBoundingClientRect(), stageRect);
+    const panelRect = rectRelativeTo(
+      transcriptRef.current
+        ?.closest(".caption-panel")
+        ?.getBoundingClientRect(),
+      stageRect,
+    );
     const leftBoundary = panelRect?.left ?? 0;
     const rightBoundary = panelRect?.right ?? window.innerWidth;
     const topBoundary = panelRect?.top ?? 0;
     const bottomBoundary = panelRect?.bottom ?? window.innerHeight;
+    const availableWidth = Math.max(0, rightBoundary - leftBoundary - 16);
+    const toolbarWidth = Math.min(230, availableWidth);
+    const editorWidth = Math.min(340, availableWidth);
     const editorTop =
       bottomBoundary - rect.bottom >= 188
         ? rect.bottom + 8
@@ -1724,36 +2295,61 @@ export function App({ embedded = false, onCollapse = null }) {
       charEnd,
       left: Math.max(
         leftBoundary + 8,
-        Math.min(rect.left, rightBoundary - 220),
+        Math.min(rect.left, rightBoundary - toolbarWidth - 8),
       ),
       top: Math.max(topBoundary + 58, rect.top - 46),
+      toolbarMaxWidth: toolbarWidth,
       editorLeft: Math.max(
         leftBoundary + 8,
-        Math.min(rect.left, rightBoundary - 348),
+        Math.min(rect.left, rightBoundary - editorWidth - 8),
       ),
       editorTop: Math.max(
         topBoundary + 8,
         Math.min(editorTop, bottomBoundary - 180),
       ),
+      editorWidth,
     });
+    pauseCaptionFollowForUser();
   };
 
-  const startComment = () => {
-    if (!selection) return;
+  const startComment = (event) => {
+    if (!selection || !requireLearningRecords()) return;
+    const returnFocusElement =
+      event?.currentTarget instanceof HTMLElement
+        ? event.currentTarget
+        : null;
+    pauseCaptionFollowForUser();
     setThreadEditor(null);
-    setDraft({ ...selection, kind: "note", body: "", floating: true });
+    setDraft({
+      ...selection,
+      kind: "note",
+      body: "",
+      floating: true,
+      returnFocusElement,
+    });
     setExpandedSentenceId(null);
     setSelection(null);
   };
 
   const startSentenceNote = (sentence, anchorElement = null) => {
-    if (!sentence) return;
+    if (!sentence || !requireLearningRecords()) return;
+    pauseCaptionFollowForUser();
     setThreadEditor(null);
-    const panelRect = transcriptRef.current
-      ?.closest(".caption-panel")
-      ?.getBoundingClientRect();
-    const anchorRect = anchorElement?.getBoundingClientRect();
+    const stageRect = stageRef.current?.getBoundingClientRect();
+    const panelRect = rectRelativeTo(
+      transcriptRef.current
+        ?.closest(".caption-panel")
+        ?.getBoundingClientRect(),
+      stageRect,
+    );
+    const anchorRect = rectRelativeTo(
+      anchorElement?.getBoundingClientRect(),
+      stageRect,
+    );
     const floating = Boolean(panelRect && anchorRect);
+    const editorWidth = floating
+      ? Math.min(340, Math.max(0, panelRect.width - 16))
+      : 340;
     setExpandedSentenceId(floating ? null : sentence.id);
     setDraft({
       exact: sentence.text,
@@ -1765,23 +2361,63 @@ export function App({ embedded = false, onCollapse = null }) {
       kind: "note",
       body: "",
       floating,
+      returnFocusElement: anchorElement,
       ...(floating
         ? {
             editorLeft: Math.max(
               panelRect.left + 8,
-              Math.min(anchorRect.left - 300, panelRect.right - 348),
+              Math.min(
+                anchorRect.right - editorWidth,
+                panelRect.right - editorWidth - 8,
+              ),
             ),
             editorTop: Math.max(
               panelRect.top + 8,
               Math.min(anchorRect.bottom + 8, panelRect.bottom - 180),
             ),
+            editorWidth,
           }
         : {}),
     });
   };
 
+  const restorePopoverFocus = (surface) => {
+    if (!surface) return;
+    const directTarget = surface.returnFocusElement;
+    const sentenceId = surface.sentenceId;
+    window.requestAnimationFrame(() => {
+      if (directTarget?.isConnected) {
+        directTarget.focus({ preventScroll: true });
+        return;
+      }
+      if (!sentenceId) return;
+      const escapedId = globalThis.CSS?.escape
+        ? globalThis.CSS.escape(sentenceId)
+        : String(sentenceId).replace(/["\\]/g, "\\$&");
+      const row = transcriptRef.current?.querySelector(
+        `[data-sentence-id="${escapedId}"]`,
+      );
+      row
+        ?.querySelector(".transcript-row__actions button:last-child")
+        ?.focus({ preventScroll: true });
+    });
+  };
+
+  const cancelDraft = () => {
+    const closingDraft = draft;
+    setDraft(null);
+    clearTextSelection(transcriptRef.current);
+    restorePopoverFocus(closingDraft);
+  };
+
+  const cancelThreadEditor = () => {
+    const closingEditor = threadEditor;
+    setThreadEditor(null);
+    restorePopoverFocus(closingEditor);
+  };
+
   const commitComment = () => {
-    if (!draft) return;
+    if (!draft || !requireLearningRecords()) return;
     const sentence = document.sentences.find(
       (item) => item.id === draft.sentenceId,
     );
@@ -1803,15 +2439,18 @@ export function App({ embedded = false, onCollapse = null }) {
     setExpandedSentenceId(draft.floating ? null : draft.sentenceId);
     setDraft(null);
     clearTextSelection(transcriptRef.current);
+    restorePopoverFocus(draft);
     setToast("批注已保存");
   };
 
   const deleteAnnotation = (id) => {
+    if (!requireLearningRecords()) return;
     setAnnotationThreads((items) => deleteAnnotationThread(items, id));
     setToast("批注线程已删除");
   };
 
   const savePhrase = (phrase) => {
+    if (!requireLearningRecords()) return;
     const key = phraseKey(phrase);
     if (savedPhraseIds.has(phrase.id) || savedPhraseIds.has(key)) {
       Promise.resolve(recordPhraseFeedback(phrase, "unsaved")).catch(() => {});
@@ -1837,6 +2476,7 @@ export function App({ embedded = false, onCollapse = null }) {
   };
 
   const editThread = (threadId, body) => {
+    if (!requireLearningRecords()) return;
     setAnnotationThreads((items) =>
       editAnnotationThread(items, threadId, { body }),
     );
@@ -1848,6 +2488,7 @@ export function App({ embedded = false, onCollapse = null }) {
     sentenceThreads,
     preferredThreadId = null,
   ) => {
+    if (!requireLearningRecords()) return;
     const preferredIndex = sentenceThreads.findIndex(
       (item) => item.id === preferredThreadId,
     );
@@ -1858,15 +2499,23 @@ export function App({ embedded = false, onCollapse = null }) {
       preferredIndex >= 0 ? preferredIndex : Math.max(0, fallbackIndex);
     const thread = sentenceThreads[activeIndex] ?? sentenceThreads[0];
     if (!thread || !anchorElement) return;
+    pauseCaptionFollowForUser();
     const rootComment =
       thread.comments?.find((comment) => comment.parentId == null) ??
       thread.comments?.[0];
-    const panelRect = transcriptRef.current
-      ?.closest(".caption-panel")
-      ?.getBoundingClientRect();
-    const anchorRect = anchorElement.getBoundingClientRect();
+    const stageRect = stageRef.current?.getBoundingClientRect();
+    const panelRect = rectRelativeTo(
+      transcriptRef.current
+        ?.closest(".caption-panel")
+        ?.getBoundingClientRect(),
+      stageRect,
+    );
+    const anchorRect = rectRelativeTo(
+      anchorElement.getBoundingClientRect(),
+      stageRect,
+    );
     if (!panelRect) return;
-    const width = 316;
+    const width = Math.min(316, Math.max(0, panelRect.width - 16));
     const height = 154;
     const belowTop = anchorRect.bottom + 8;
     const top =
@@ -1883,9 +2532,12 @@ export function App({ embedded = false, onCollapse = null }) {
     });
     setThreadEditor({
       threadId: thread.id,
+      sentenceId: thread.anchor?.sentenceId,
       body: rootComment?.body ?? "",
       threads: editorThreads,
       activeIndex,
+      returnFocusElement: anchorElement,
+      width,
       left: Math.max(
         panelRect.left + 8,
         Math.min(anchorRect.right - width, panelRect.right - width - 8),
@@ -1895,12 +2547,15 @@ export function App({ embedded = false, onCollapse = null }) {
   };
 
   const commitThreadEditor = () => {
-    if (!threadEditor?.body.trim()) return;
+    if (!threadEditor?.body.trim() || !requireLearningRecords()) return;
+    const closingEditor = threadEditor;
     editThread(threadEditor.threadId, threadEditor.body.trim());
     setThreadEditor(null);
+    restorePopoverFocus(closingEditor);
   };
 
   const replyToThread = (threadId, body) => {
+    if (!requireLearningRecords()) return;
     setAnnotationThreads((items) =>
       replyToAnnotationThread(items, threadId, body),
     );
@@ -1908,6 +2563,7 @@ export function App({ embedded = false, onCollapse = null }) {
   };
 
   const resolveThread = (threadId) => {
+    if (!requireLearningRecords()) return;
     setAnnotationThreads((items) =>
       resolveAnnotationThread(items, threadId),
     );
@@ -1915,6 +2571,7 @@ export function App({ embedded = false, onCollapse = null }) {
   };
 
   const reopenThread = (threadId) => {
+    if (!requireLearningRecords()) return;
     setAnnotationThreads((items) =>
       reopenAnnotationThread(items, threadId),
     );
@@ -1988,9 +2645,9 @@ export function App({ embedded = false, onCollapse = null }) {
         } else if (menuOpen) {
           setMenuOpen(false);
         } else if (draft) {
-          setDraft(null);
+          cancelDraft();
         } else if (threadEditor) {
-          setThreadEditor(null);
+          cancelThreadEditor();
         } else if (expandedSentenceId) {
           setExpandedSentenceId(null);
         } else if (searchOpen) {
@@ -2012,6 +2669,7 @@ export function App({ embedded = false, onCollapse = null }) {
         return;
       }
       if (
+        currentCaptionReady &&
         (event.metaKey || event.ctrlKey) &&
         event.shiftKey &&
         event.key.toLowerCase() === "c"
@@ -2025,6 +2683,7 @@ export function App({ embedded = false, onCollapse = null }) {
   }, [
     activePhrase,
     copySentence,
+    currentCaptionReady,
     draft,
     embedded,
     expandedSentenceId,
@@ -2045,6 +2704,7 @@ export function App({ embedded = false, onCollapse = null }) {
   );
 
   const copyStudyNotes = async () => {
+    if (!requireLearningRecords()) return;
     try {
       await writeClipboard(
         exportStudyMarkdown(exportDocument, annotationThreads, {
@@ -2059,6 +2719,7 @@ export function App({ embedded = false, onCollapse = null }) {
   };
 
   const downloadExport = (format) => {
+    if (!requireLearningRecords()) return;
     const isJson = format === "json";
     const content = isJson
       ? exportStudyJson(exportDocument, annotationThreads, {
@@ -2086,10 +2747,33 @@ export function App({ embedded = false, onCollapse = null }) {
   };
 
   const showStudySheet = () => {
+    if (!requireLearningRecords()) return;
     setActiveTab("study");
     setDraft(null);
     setExpandedSentenceId(null);
   };
+
+  const playTranscriptRow = useStableEvent((sentence) =>
+    playFromSentence(sentence.startMs),
+  );
+  const copyTranscriptRow = useStableEvent((sentence) =>
+    copySentence(sentence),
+  );
+  const openTranscriptRowAnnotations = useStableEvent(
+    (anchorElement, sentenceId, preferredThreadId = null) =>
+      openThreadEditor(
+        anchorElement,
+        threadsBySentence.get(sentenceId) ?? EMPTY_LIST,
+        preferredThreadId,
+      ),
+  );
+  const startTranscriptRowNote = useStableEvent((sentence, anchorElement) =>
+    startSentenceNote(sentence, anchorElement),
+  );
+  const enterTranscriptPhrase = useStableEvent(handlePhraseEnter);
+  const focusTranscriptPhrase = useStableEvent(handlePhraseFocus);
+  const leaveTranscriptPhrase = useStableEvent(schedulePhraseClose);
+  const activateTranscriptPhrase = useStableEvent(savePhrase);
 
   const StageElement = embedded ? "aside" : "main";
 
@@ -2104,9 +2788,46 @@ export function App({ embedded = false, onCollapse = null }) {
       ref={stageRef}
       onPointerEnter={() => {
         panelHoveredRef.current = true;
+        clearCaptionFollowIdleTimer();
       }}
       onPointerLeave={() => {
         panelHoveredRef.current = false;
+        scheduleCaptionFollowIdleResume();
+      }}
+      onPointerDownCapture={() => {
+        panelHoveredRef.current = true;
+        clearCaptionFollowIdleTimer();
+      }}
+      onTouchStartCapture={() => {
+        panelHoveredRef.current = true;
+        clearCaptionFollowIdleTimer();
+      }}
+      onWheelCapture={() => {
+        panelHoveredRef.current = true;
+        clearCaptionFollowIdleTimer();
+      }}
+      onKeyDownCapture={(event) => {
+        if (
+          event.target.closest?.(
+            "input, textarea, select, [contenteditable='true']",
+          )
+        ) {
+          return;
+        }
+        if (CAPTION_FOLLOW_SCROLL_KEYS.has(event.key)) {
+          restartCaptionFollowIdleWindow();
+        }
+      }}
+      onFocusCapture={() => {
+        window.clearTimeout(captionFollowFocusTimerRef.current);
+        clearCaptionFollowIdleTimer();
+      }}
+      onBlurCapture={() => {
+        window.clearTimeout(captionFollowFocusTimerRef.current);
+        captionFollowFocusTimerRef.current = window.setTimeout(
+          scheduleCaptionFollowIdleResume,
+          0,
+        );
       }}
     >
       <section
@@ -2228,6 +2949,7 @@ export function App({ embedded = false, onCollapse = null }) {
                                 themeMode === option.value ? "is-selected" : ""
                               }
                               key={option.value}
+                              disabled={!settingsReady}
                               onClick={() => applyThemeMode(option.value)}
                               type="button"
                             >
@@ -2242,6 +2964,7 @@ export function App({ embedded = false, onCollapse = null }) {
                       <button
                         aria-checked={showPhrases}
                         className="menu-toggle"
+                        disabled={!settingsReady}
                         onClick={() => setShowPhrases((value) => !value)}
                         role="switch"
                         type="button"
@@ -2258,6 +2981,7 @@ export function App({ embedded = false, onCollapse = null }) {
                   <span className="overflow-menu__rule" />
                   <span className="overflow-menu__label">带走学习记录</span>
                   <button
+                    disabled={!learningRecordsReady || !settingsReady}
                     onClick={() =>
                       setIncludeAllCandidates((value) => !value)
                     }
@@ -2273,6 +2997,7 @@ export function App({ embedded = false, onCollapse = null }) {
                       : "只导出已收藏短语"}
                   </button>
                   <button
+                    disabled={!learningRecordsReady}
                     onClick={() => {
                       downloadExport("markdown");
                       setMenuOpen(false);
@@ -2283,6 +3008,7 @@ export function App({ embedded = false, onCollapse = null }) {
                     导出 Markdown
                   </button>
                   <button
+                    disabled={!learningRecordsReady}
                     onClick={() => {
                       downloadExport("json");
                       setMenuOpen(false);
@@ -2343,6 +3069,7 @@ export function App({ embedded = false, onCollapse = null }) {
 
         <div className={`workbench${drawerOpen ? " has-drawer" : ""}`}>
           {activeTab === "transcript" &&
+          currentCaptionReady &&
           captionFollowMode === CAPTION_FOLLOW_MODE.MANUAL &&
           activeSentence ? (
             <button
@@ -2362,106 +3089,23 @@ export function App({ embedded = false, onCollapse = null }) {
               ref={transcriptRef}
             >
               {renderedSentences.length ? (
-                <section className="transcript-stream">
-                  {renderedSentences.map((sentence) => {
-                    const rowAnnotations =
-                      annotationsBySentence.get(sentence.id) ?? [];
-                    const isActive = sentence.id === activeSentenceId;
-                    return (
-                      <article
-                        className={`transcript-row${
-                          isActive ? " is-active" : ""
-                        }`}
-                        data-sentence-id={sentence.id}
-                        key={sentence.id}
-                      >
-                        <button
-                          aria-label={`从 ${formatTime(sentence.startMs)} 开始播放`}
-                          className="transcript-row__time"
-                          onClick={() => playFromSentence(sentence.startMs)}
-                          title="从这里播放"
-                          type="button"
-                        >
-                          <IconPlayerPlayFilled aria-hidden="true" size={11} />
-                          {formatTime(sentence.startMs)}
-                        </button>
-                        <p className="transcript-row__text" data-sentence-text="">
-                          <PhraseText
-                            annotations={rowAnnotations}
-                            onAnnotationActivate={(event, annotation) =>
-                              openThreadEditor(
-                                event.currentTarget,
-                                threadsBySentence.get(sentence.id) ?? [],
-                                annotation.id,
-                              )
-                            }
-                            onPhraseEnter={handlePhraseEnter}
-                            onPhraseFocus={handlePhraseFocus}
-                            onPhraseLeave={schedulePhraseClose}
-                            onPhraseActivate={savePhrase}
-                            phrases={phrasesBySentence.get(sentence.id) ?? []}
-                            savedPhraseIds={savedPhraseIds}
-                            sentence={sentence}
-                            showPhrases={showPhrases}
-                          />
-                        </p>
-                        <div className="transcript-row__actions">
-                          <button
-                            aria-label={`${formatTime(sentence.startMs)} 复制整句`}
-                            className={`transcript-row__copy${
-                              copiedSentenceId === sentence.id
-                                ? " is-copied"
-                                : ""
-                            }`}
-                            onClick={() => copySentence(sentence)}
-                            title="复制整句"
-                            type="button"
-                          >
-                            {copiedSentenceId === sentence.id ? (
-                              <IconCheck aria-hidden="true" size={15} />
-                            ) : (
-                              <IconCopy aria-hidden="true" size={15} />
-                            )}
-                            <span className="transcript-row__action-label">
-                              {copiedSentenceId === sentence.id ? "已复制" : "复制"}
-                            </span>
-                          </button>
-                          <button
-                            aria-label={
-                              rowAnnotations.length
-                                ? `${rowAnnotations.length} 条批注`
-                                : "添加整句批注"
-                            }
-                            className={
-                              rowAnnotations.length ? "has-count" : ""
-                            }
-                            onClick={(event) => {
-                              if (rowAnnotations.length) {
-                                openThreadEditor(
-                                  event.currentTarget,
-                                  threadsBySentence.get(sentence.id) ?? [],
-                                );
-                              } else {
-                                startSentenceNote(sentence, event.currentTarget);
-                              }
-                            }}
-                            title={
-                              rowAnnotations.length ? "查看批注" : "添加整句批注"
-                            }
-                            type="button"
-                          >
-                            <IconMessageCircle aria-hidden="true" size={15} />
-                            {rowAnnotations.length > 0 && (
-                              <span className="transcript-row__count">
-                                {rowAnnotations.length}
-                              </span>
-                            )}
-                          </button>
-                        </div>
-                      </article>
-                    );
-                  })}
-                </section>
+                <TranscriptStream
+                  activeSentenceId={activeSentenceId}
+                  annotationsBySentence={annotationsBySentence}
+                  copiedSentenceId={copiedSentenceId}
+                  onCopy={copyTranscriptRow}
+                  onOpenAnnotations={openTranscriptRowAnnotations}
+                  onPhraseActivate={activateTranscriptPhrase}
+                  onPhraseEnter={enterTranscriptPhrase}
+                  onPhraseFocus={focusTranscriptPhrase}
+                  onPhraseLeave={leaveTranscriptPhrase}
+                  onPlay={playTranscriptRow}
+                  onStartNote={startTranscriptRowNote}
+                  phrasesBySentence={phrasesBySentence}
+                  savedPhraseIds={savedPhraseIds}
+                  sentences={renderedSentences}
+                  showPhrases={showPhrases}
+                />
               ) : (
                 <div className="empty-state">
                   {waitingForCurrentCaption ? (
@@ -2569,15 +3213,21 @@ export function App({ embedded = false, onCollapse = null }) {
             className={`study-dock__sheet${
               activeTab === "study" ? " is-active" : ""
             }`}
+            disabled={!learningRecordsReady && activeTab !== "study"}
             onClick={activeTab === "study" ? showTranscript : showStudySheet}
             type="button"
           >
             <IconBookmark aria-hidden="true" size={22} stroke={1.8} />
             <span>{activeTab === "study" ? "返回研读" : "学习单"}</span>
-            <strong>{savedPhrases.length + annotationThreads.length}</strong>
+            <strong>
+              {learningRecordsReady
+                ? savedPhrases.length + annotationThreads.length
+                : 0}
+            </strong>
           </button>
           <button
             className="study-dock__copy"
+            disabled={!learningRecordsReady}
             onClick={copyStudyNotes}
             type="button"
           >
@@ -2602,27 +3252,26 @@ export function App({ embedded = false, onCollapse = null }) {
       <SelectionToolbar
         onAddComment={startComment}
         onCopySelection={copySelectedText}
-        selection={selection}
+        selection={currentCaptionReady ? selection : null}
       />
       <CommentPopover
-        draft={draft}
-        onCancel={() => {
-          setDraft(null);
-          clearTextSelection(transcriptRef.current);
-        }}
+        draft={currentCaptionReady ? draft : null}
+        onCancel={cancelDraft}
         onChange={(body) => setDraft((value) => ({ ...value, body }))}
         onSave={commitComment}
       />
       <ThreadEditorPopover
-        editor={threadEditor}
-        onCancel={() => setThreadEditor(null)}
+        editor={currentCaptionReady ? threadEditor : null}
+        onCancel={cancelThreadEditor}
         onChange={(body) =>
           setThreadEditor((value) => ({ ...value, body }))
         }
         onDelete={() => {
           if (!threadEditor) return;
+          const closingEditor = threadEditor;
           deleteAnnotation(threadEditor.threadId);
           setThreadEditor(null);
+          restorePopoverFocus(closingEditor);
         }}
         onSave={commitThreadEditor}
         onSelectThread={(index) => {

@@ -1,0 +1,66 @@
+name: Release Captiono
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tag and package versions
+        shell: bash
+        run: |
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          MANIFEST_VERSION="$(node -p "require('./extension/manifest.json').version")"
+          test "$PACKAGE_VERSION" = "$MANIFEST_VERSION"
+          test "$GITHUB_REF_NAME" = "v$PACKAGE_VERSION"
+
+      - name: Build verified extension archive
+        run: npm run build:extension
+
+      - name: Run tests
+        run: npm test
+
+      - name: Create checksum
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sha256sum "dist/captiono-$VERSION.zip" > "dist/captiono-$VERSION.zip.sha256"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES_FILE=".github/release-notes/$GITHUB_REF_NAME.md"
+          test -f "$NOTES_FILE"
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/captiono-$VERSION.zip#Captiono $VERSION Chrome extension" \
+            "dist/captiono-$VERSION.zip.sha256#SHA-256 checksum" \
+            --verify-tag \
+            --fail-on-no-commits \
+            --title "Captiono $GITHUB_REF_NAME" \
+            --notes-file "$NOTES_FILE"

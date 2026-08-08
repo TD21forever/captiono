@@ -1,9 +1,11 @@
 #!/usr/bin/env node
+import { execFileSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
 } from "node:fs";
 import path from "node:path";
@@ -74,10 +76,57 @@ if (
   throw new Error("Generated extension is not configured for the page panel");
 }
 
-for (const file of [...extensionFiles, "caption-review-ui.js"]) {
+const archiveFiles = [...extensionFiles, "caption-review-ui.js"].sort();
+for (const file of archiveFiles) {
   if (!existsSync(path.join(extensionDistDir, file))) {
     throw new Error(`Generated extension is missing: ${file}`);
   }
 }
 
+const archivePath = path.join(
+  expectedDistParent,
+  `captiono-${manifest.version}.zip`,
+);
+const temporaryArchivePath = path.join(
+  expectedDistParent,
+  `.captiono-${manifest.version}-${process.pid}.zip`,
+);
+rmSync(temporaryArchivePath, { force: true });
+
+try {
+  execFileSync(
+    "zip",
+    ["-q", "-X", temporaryArchivePath, ...archiveFiles],
+    { cwd: extensionDistDir },
+  );
+
+  const archivedFiles = execFileSync(
+    "unzip",
+    ["-Z1", temporaryArchivePath],
+    { encoding: "utf8" },
+  )
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .sort();
+  if (JSON.stringify(archivedFiles) !== JSON.stringify(archiveFiles)) {
+    throw new Error(
+      `Release archive file list mismatch: ${archivedFiles.join(", ")}`,
+    );
+  }
+
+  for (const file of archiveFiles) {
+    const archived = execFileSync("unzip", ["-p", temporaryArchivePath, file]);
+    const unpacked = readFileSync(path.join(extensionDistDir, file));
+    if (!archived.equals(unpacked)) {
+      throw new Error(`Release archive differs from unpacked build: ${file}`);
+    }
+  }
+
+  rmSync(archivePath, { force: true });
+  renameSync(temporaryArchivePath, archivePath);
+} finally {
+  rmSync(temporaryArchivePath, { force: true });
+}
+
 console.log(`Prepared Chrome extension: ${extensionDistDir}`);
+console.log(`Prepared verified release archive: ${archivePath}`);

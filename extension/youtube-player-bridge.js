@@ -1,6 +1,10 @@
 export async function captureYouTubeCaptionUrl(request) {
   const CAPTURE_TIMEOUT_MS = 3200;
   const RELOAD_TIMEOUT_MS = 700;
+  const MAX_DISCOVERED_TRACKS = 120;
+  const MAX_TRACK_LABEL_LENGTH = 160;
+  const MAX_TRACK_LANGUAGE_LENGTH = 24;
+  const MAX_TRACK_VSS_ID_LENGTH = 80;
 
   function normalizeSpace(value) {
     return String(value ?? "").replace(/\s+/g, " ").trim();
@@ -53,11 +57,16 @@ export async function captureYouTubeCaptionUrl(request) {
   }
 
   function trackVssId(track) {
-    return normalizeSpace(track?.vss_id ?? track?.vssId);
+    return normalizeSpace(track?.vss_id ?? track?.vssId).slice(
+      0,
+      MAX_TRACK_VSS_ID_LENGTH,
+    );
   }
 
   function trackLanguage(track) {
-    return normalizeSpace(track?.languageCode).toLowerCase();
+    return normalizeSpace(track?.languageCode)
+      .toLowerCase()
+      .slice(0, MAX_TRACK_LANGUAGE_LENGTH);
   }
 
   function sameTrack(left, right) {
@@ -78,7 +87,7 @@ export async function captureYouTubeCaptionUrl(request) {
       id: vssId || `youtube-player-${language || "und"}-${kind}-${index + 1}`,
       label: normalizeSpace(
         track?.displayName || track?.languageName || language || "Subtitles",
-      ),
+      ).slice(0, MAX_TRACK_LABEL_LENGTH),
       language,
       kind,
       vssId,
@@ -361,7 +370,13 @@ export async function captureYouTubeCaptionUrl(request) {
         async () => {
           if (wasOn && sameTrack(originalTrack, track)) {
             toggleSubtitles(player);
-            await new Promise((resolve) => setTimeout(resolve, 80));
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            // Re-enable the learner's current captions immediately. The
+            // resource observer can continue waiting without leaving the
+            // native subtitle UI hidden for the full capture timeout.
+            toggleSubtitles(player);
+            player.setOption("captions", "track", track);
+            return;
           }
           player.setOption("captions", "track", track);
         },
@@ -433,7 +448,9 @@ export async function captureYouTubeCaptionUrl(request) {
 
     if (request?.discoverOnly) {
       const discovery = await discoverPlayerTracks(player);
-      const tracks = discovery.tracks.map(publicTrack);
+      const tracks = discovery.tracks
+        .slice(0, MAX_DISCOVERED_TRACKS)
+        .map(publicTrack);
       return {
         ok: tracks.length > 0,
         source: "youtube-player-caption",

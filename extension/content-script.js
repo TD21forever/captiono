@@ -4,7 +4,6 @@
 
   const PUBLISH_INTERVAL_MS = 500;
   const TRACK_WAIT_TIMEOUT_MS = 1800;
-  const TRACK_RETRY_INTERVAL_MS = 2500;
   const CAPTION_KINDS = new Set(["captions", "subtitles"]);
   const READY_STATE_NAMES = ["none", "loading", "loaded", "error"];
   const PAGE_TEXT_TRACK_SOURCE = "page-text-track";
@@ -21,6 +20,7 @@
   const manifestCueRequests = new Map();
   const manifestRequestControllers = new Set();
   const pageBridgeListeners = new Set();
+  const observedEventListeners = [];
 
   let nextTrackId = 1;
   let selectedTrackId = "";
@@ -30,11 +30,16 @@
   let pendingAutomaticRefresh = false;
   let pendingRefreshDelayMs = 120;
   let intervalId = null;
-  let retryIntervalId = null;
   let mutationObserver = null;
+  let observedCaptionMutationTarget = null;
+  let captionAttributeObserver = null;
+  let observedCaptionVideo = null;
   let bridgeStopped = false;
   let userCaptionRequestCount = 0;
   let previousMediaKey = "";
+  let publishedPrimaryVideo;
+  let suppressTrackEventsUntil = 0;
+  let boundPrimaryVideo = null;
   let captionState = unavailableCaptionState(
     "not-requested",
     "尚未读取当前页面的字幕轨。",
@@ -95,8 +100,10 @@
     if (bridgeStopped) return null;
     try {
       return await chrome.runtime.sendMessage(message);
-    } catch {
-      stopBridge();
+    } catch (error) {
+      if (/extension context invalidated/i.test(String(error?.message ?? error))) {
+        stopBridge();
+      }
       return null;
     }
   }
@@ -133,6 +140,29 @@
       url.pathname.match(/\/bangumi\/play\/((?:ep|ss)\d+)/i)?.[1] ||
       ""
     );
+  }
+
+  function isSupportedVideoPage(url = pageUrl()) {
+    if (!url) return false;
+    const hostname = url.hostname.toLowerCase();
+    if (hostname === "youtube.com" || hostname.endsWith(".youtube.com")) {
+      return url.pathname === "/watch" && Boolean(youtubeVideoId(url));
+    }
+    if (hostname === "bilibili.com" || hostname.endsWith(".bilibili.com")) {
+      return Boolean(bilibiliMediaId(url));
+    }
+    return false;
+  }
+
+  function suppressInternalTrackEvents(durationMs = 350) {
+    suppressTrackEventsUntil = Math.max(
+      suppressTrackEventsUntil,
+      Date.now() + durationMs,
+    );
+  }
+
+  function internalTrackEventsAreSuppressed() {
+    return Date.now() < suppressTrackEventsUntil;
   }
 
   function bilibiliMediaBindingId(url = pageUrl()) {
@@ -206,24 +236,8 @@
       1,
       Math.round(Number(pageUrl()?.searchParams.get("p"))) || 1,
     );
-    let aid = null;
-    let cid = null;
-
-    const scripts = Array.from(document.scripts ?? []);
-    for (let index = scripts.length - 1; index >= 0; index -= 1) {
-      const source = String(scripts[index]?.text ?? "");
-      if (!source.includes("__INITIAL_STATE__")) continue;
-      const state = extractAssignedJson(source, "__INITIAL_STATE__");
-      if (!state) continue;
-      const videoData = state.videoData ?? state.epInfo ?? {};
-      aid = Number(videoData.aid ?? state.aid) || null;
-      cid = Number(videoData.cid ?? state.cid) || null;
-      if (aid && cid) break;
-    }
 
     return {
-      aid,
-      cid,
       mediaId,
       bindingMediaId: `${mediaId}:p${page}`,
       page,
@@ -760,14 +774,72 @@
     const visibleArea =
       Math.max(0, Math.min(rect.right, innerWidth) - Math.max(rect.left, 0)) *
       Math.max(0, Math.min(rect.bottom, innerHeight) - Math.max(rect.top, 0));
+    const layoutArea = Math.max(0, rect.width || rect.right - rect.left) *
+      Math.max(0, rect.height || rect.bottom - rect.top);
 
-    return (video.paused ? 0 : 1_000_000_000) + visibleArea + video.readyState;
+    // A tiny autoplaying hover preview must never replace a paused main video.
+    // Visible/layout area is authoritative; playback is only a final tie-break.
+    return (
+      visibleArea * 1_000 +
+      layoutArea +
+      (video.paused ? 0 : 10) +
+      finiteNumber(video.readyState)
+    );
+  }
+
+  function platformVideoSelector() {
+    if (youtubeVideoId()) {
+      return [
+        "#movie_player video.html5-main-video",
+        "ytd-player #movie_player video",
+      ].join(", ");
+    }
+    if (bilibiliMediaId()) {
+      return [
+        "#bilibili-player .bpx-player-video-wrap video",
+        "#bilibili-player video",
+        ".bpx-player-container .bpx-player-video-wrap video",
+      ].join(", ");
+    }
+    return "";
+  }
+
+  function platformVideoCandidates() {
+    const selector = platformVideoSelector();
+    const scoped = selector
+      ? Array.from(document.querySelectorAll(selector))
+      : [];
+    return scoped.length > 0
+      ? scoped
+      : Array.from(document.querySelectorAll("video"));
+  }
+
+  function isPotentialPrimaryVideo(video) {
+    if (!video || String(video.tagName ?? "").toLowerCase() !== "video") {
+      return false;
+    }
+    const selector = platformVideoSelector();
+    if (!selector || !video.matches) return true;
+    try {
+      return video.matches(selector);
+    } catch {
+      return false;
+    }
   }
 
   function primaryVideo() {
-    return Array.from(document.querySelectorAll("video")).sort(
+    const candidates = platformVideoCandidates();
+    if (
+      boundPrimaryVideo &&
+      candidates.includes(boundPrimaryVideo) &&
+      videoScore(boundPrimaryVideo) > 100
+    ) {
+      return boundPrimaryVideo;
+    }
+    boundPrimaryVideo = candidates.sort(
       (left, right) => videoScore(right) - videoScore(left),
     )[0] ?? null;
+    return boundPrimaryVideo;
   }
 
   function mediaBinding(video) {
@@ -788,8 +860,37 @@
     };
   }
 
-  function mediaState() {
-    const video = primaryVideo();
+  function mediaBindingsMatch(left, right) {
+    if (
+      left?.provider &&
+      left?.mediaId &&
+      right?.provider &&
+      right?.mediaId
+    ) {
+      return (
+        left.provider === right.provider && left.mediaId === right.mediaId
+      );
+    }
+    return Boolean(
+      left?.pageUrl &&
+        right?.pageUrl &&
+        left.pageUrl === right.pageUrl &&
+        left.title === right.title &&
+        (!left.mediaSrc ||
+          !right.mediaSrc ||
+          left.mediaSrc === right.mediaSrc),
+    );
+  }
+
+  function refreshMediaIsCurrent(video, startBinding) {
+    const currentVideo = primaryVideo();
+    return Boolean(
+      currentVideo === video &&
+        mediaBindingsMatch(startBinding, mediaBinding(currentVideo)),
+    );
+  }
+
+  function mediaState(video = primaryVideo()) {
     const binding = mediaBinding(video);
 
     return {
@@ -824,7 +925,6 @@
     if (!publish) return;
 
     publishToPageBridge({ type: "CAPTION_STATE", state: captionState });
-    void sendRuntimeMessage({ type: "CAPTION_STATE", state: captionState });
   }
 
   async function seekTo(message) {
@@ -1197,9 +1297,13 @@
       };
     }
 
+    const originalMode = candidate.track.mode;
+    let activatedByCaptiono = false;
     try {
-      if (candidate.track.mode === "disabled") {
+      if (originalMode === "disabled") {
+        suppressInternalTrackEvents();
         candidate.track.mode = "hidden";
+        activatedByCaptiono = true;
       }
     } catch (error) {
       return {
@@ -1210,56 +1314,81 @@
       };
     }
 
-    const deadline = Date.now() + TRACK_WAIT_TIMEOUT_MS;
-    while (Date.now() < deadline) {
-      if (candidate.element?.readyState === 3) {
-        return {
-          status: "error",
-          reason: "track-load-error",
-          message: "页面声明了字幕轨，但浏览器无法加载它。",
-          cues: [],
-        };
+    try {
+      const deadline = Date.now() + TRACK_WAIT_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        if (candidate.element?.readyState === 3) {
+          return {
+            status: "error",
+            reason: "track-load-error",
+            message: "页面声明了字幕轨，但浏览器无法加载它。",
+            cues: [],
+          };
+        }
+
+        const snapshot = readCues(candidate.track);
+        if (snapshot.error) {
+          return {
+            status: "error",
+            reason: "cue-access-failed",
+            message: snapshot.error,
+            cues: [],
+          };
+        }
+        if (
+          snapshot.cues.length > 0 ||
+          candidate.element?.readyState === 2 ||
+          (!candidate.element && candidate.track.mode !== "disabled")
+        ) {
+          return {
+            status: snapshot.cues.length > 0 ? "ready" : "empty",
+            reason:
+              snapshot.cues.length > 0 ? null : "selected-track-empty",
+            message: "",
+            cues: snapshot.cues,
+          };
+        }
+
+        await delay(100);
       }
 
-      const snapshot = readCues(candidate.track);
-      if (snapshot.error) {
-        return {
-          status: "error",
-          reason: "cue-access-failed",
-          message: snapshot.error,
-          cues: [],
-        };
+      return {
+        status: "loading",
+        reason: "track-still-loading",
+        message: "字幕轨仍在由当前页面加载，可稍后刷新。",
+        cues: [],
+      };
+    } finally {
+      if (activatedByCaptiono && candidate.track.mode === "hidden") {
+        try {
+          suppressInternalTrackEvents();
+          candidate.track.mode = originalMode;
+        } catch {
+          // The host may have detached the track while it was loading.
+        }
       }
-      if (
-        snapshot.cues.length > 0 ||
-        candidate.element?.readyState === 2 ||
-        (!candidate.element && candidate.track.mode !== "disabled")
-      ) {
-        return {
-          status: snapshot.cues.length > 0 ? "ready" : "empty",
-          reason:
-            snapshot.cues.length > 0 ? null : "selected-track-empty",
-          message: "",
-          cues: snapshot.cues,
-        };
-      }
-
-      await delay(100);
     }
-
-    return {
-      status: "loading",
-      reason: "track-still-loading",
-      message: "字幕轨仍在由当前页面加载，可稍后刷新。",
-      cues: [],
-    };
   }
 
   async function refreshManifestCaptions(video, request, version) {
+    const startBinding = mediaBinding(video);
     let candidates = youtubeManifestTracks();
     if (candidates.length === 0) {
       candidates = await youtubePlayerManifestTracks();
       if (version !== refreshVersion) return captionState;
+      if (!refreshMediaIsCurrent(video, startBinding)) {
+        const currentVideo = primaryVideo();
+        const state = manifestCaptionStateFor({
+          status: "stale",
+          reason: "media-binding-changed",
+          message: "视频页面在读取字幕时发生了变化，请刷新字幕。",
+          video: currentVideo,
+          candidates: [],
+          selected: null,
+        });
+        setCaptionState(state);
+        return state;
+      }
     }
     if (candidates.length === 0) return null;
 
@@ -1299,6 +1428,19 @@
       });
     } catch (error) {
       if (version !== refreshVersion) return captionState;
+      if (!refreshMediaIsCurrent(video, startBinding)) {
+        const currentVideo = primaryVideo();
+        const state = manifestCaptionStateFor({
+          status: "stale",
+          reason: "media-binding-changed",
+          message: "视频页面在读取字幕时发生了变化，请刷新字幕。",
+          video: currentVideo,
+          candidates: [],
+          selected: null,
+        });
+        setCaptionState(state);
+        return state;
+      }
       const state = manifestCaptionStateFor({
         status: "error",
         reason:
@@ -1319,14 +1461,8 @@
     if (version !== refreshVersion) return captionState;
     const cues = captionResult.cues;
 
-    const currentVideo = primaryVideo();
-    const currentBinding = mediaBinding(currentVideo);
-    const originalBinding = mediaBinding(video);
-    if (
-      currentVideo !== video ||
-      currentBinding.pageUrl !== originalBinding.pageUrl ||
-      currentBinding.title !== originalBinding.title
-    ) {
+    if (!refreshMediaIsCurrent(video, startBinding)) {
+      const currentVideo = primaryVideo();
       const state = manifestCaptionStateFor({
         status: "stale",
         reason: "media-binding-changed",
@@ -1457,6 +1593,7 @@
       setCaptionState(state);
       return state;
     }
+    const startBinding = mediaBinding(video);
 
     observeTracks(video);
     const candidates = discoverTracks(video);
@@ -1519,6 +1656,20 @@
     });
     if (version !== refreshVersion) return captionState;
 
+    if (!refreshMediaIsCurrent(video, startBinding)) {
+      const currentVideo = primaryVideo();
+      const state = captionStateFor({
+        status: "stale",
+        reason: "media-binding-changed",
+        message: "视频页面在读取字幕时发生了变化，请刷新字幕。",
+        video: currentVideo,
+        candidates: [],
+        selected: null,
+      });
+      setCaptionState(state);
+      return state;
+    }
+
     if (result.status !== "ready") {
       const manifestState = await platformProvider?.refresh(
         video,
@@ -1536,14 +1687,8 @@
       if (manifestState) return manifestState;
     }
 
-    const currentVideo = primaryVideo();
-    const currentBinding = mediaBinding(currentVideo);
-    const originalBinding = mediaBinding(video);
-    if (
-      currentVideo !== video ||
-      currentBinding.pageUrl !== originalBinding.pageUrl ||
-      currentBinding.title !== originalBinding.title
-    ) {
+    if (!refreshMediaIsCurrent(video, startBinding)) {
+      const currentVideo = primaryVideo();
       const state = captionStateFor({
         status: "stale",
         reason: "media-binding-changed",
@@ -1599,6 +1744,7 @@
   }
 
   function scheduleCaptionRefresh(delayMs = 120) {
+    if (bridgeStopped) return;
     if (
       automaticRefreshPromise ||
       userCaptionRequestCount > 0
@@ -1632,9 +1778,13 @@
       !observedTrackLists.has(list)
     ) {
       observedTrackLists.add(list);
-      list.addEventListener("addtrack", () => scheduleCaptionRefresh());
-      list.addEventListener("removetrack", () => scheduleCaptionRefresh());
-      list.addEventListener("change", () => scheduleCaptionRefresh());
+      for (const type of ["addtrack", "removetrack", "change"]) {
+        const handler = () => {
+          if (!internalTrackEventsAreSuppressed()) scheduleCaptionRefresh();
+        };
+        list.addEventListener(type, handler);
+        observedEventListeners.push({ handler, target: list, type });
+      }
     }
 
     for (const candidate of discoverTracks(video)) {
@@ -1643,14 +1793,21 @@
         !observedTracks.has(candidate.track)
       ) {
         observedTracks.add(candidate.track);
-        candidate.track.addEventListener("cuechange", () => {
-          const currentCueCount =
-            captionState.document?.selectedTrackId === candidate.id
-              ? captionState.document.cues.length
-              : null;
+        const handler = () => {
+          if (internalTrackEventsAreSuppressed()) return;
+          const currentSelectedTrackId =
+            captionState.document?.selectedTrackId || selectedTrackId;
+          if (candidate.id !== currentSelectedTrackId) return;
+          const currentCueCount = captionState.document?.cues.length ?? null;
           if (readCueCount(candidate.track) !== currentCueCount) {
             scheduleCaptionRefresh(250);
           }
+        };
+        candidate.track.addEventListener("cuechange", handler);
+        observedEventListeners.push({
+          handler,
+          target: candidate.track,
+          type: "cuechange",
         });
       }
     }
@@ -1688,7 +1845,7 @@
     }
   }
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  function handleRuntimeMessage(message, _sender, sendResponse) {
     const response = handlePageBridgeMessage(message);
     if (response === undefined) return undefined;
     if (response && typeof response.then === "function") {
@@ -1697,7 +1854,8 @@
     }
     sendResponse(response);
     return undefined;
-  });
+  }
+  chrome.runtime.onMessage.addListener(handleRuntimeMessage);
 
   const pageBridge = {
     request(message) {
@@ -1712,15 +1870,40 @@
   globalThis.__captionReviewPageBridge = pageBridge;
 
   function publishState() {
-    const state = mediaState();
+    if (document.hidden) return;
+    if (!isSupportedVideoPage()) {
+      if (previousMediaKey) {
+        previousMediaKey = "";
+        selectedTrackId = "";
+        boundPrimaryVideo = null;
+        publishedPrimaryVideo = undefined;
+        refreshVersion += 1;
+        for (const controller of manifestRequestControllers) controller.abort();
+        manifestRequestControllers.clear();
+      }
+      observeYouTubeCaptionStructure(null);
+      observePrimaryVideoCaptionAttributes(null);
+      return;
+    }
+    const video = primaryVideo();
+    const primaryVideoChanged =
+      publishedPrimaryVideo !== undefined && publishedPrimaryVideo !== video;
+    publishedPrimaryVideo = video;
+    const state = mediaState(video);
+    const youtubeVideo =
+      youtubeVideoId() && isPotentialPrimaryVideo(video)
+        ? video
+        : null;
+    observeYouTubeCaptionStructure(youtubeVideo);
+    observePrimaryVideoCaptionAttributes(youtubeVideo);
     publishToPageBridge({ type: "MEDIA_STATE", state });
-    void sendRuntimeMessage({ type: "MEDIA_STATE", state });
 
     const nextMediaKey =
       state.provider && state.mediaId
         ? `${state.provider}\n${state.mediaId}`
         : `${state.url}\n${state.title}\n${state.mediaSrc}`;
-    if (nextMediaKey !== previousMediaKey) {
+    const mediaKeyChanged = nextMediaKey !== previousMediaKey;
+    if (mediaKeyChanged || primaryVideoChanged) {
       previousMediaKey = nextMediaKey;
       selectedTrackId = "";
       refreshVersion += 1;
@@ -1729,7 +1912,9 @@
       setCaptionState({
         protocolVersion: 1,
         status: "loading",
-        reason: "media-binding-changed",
+        reason: mediaKeyChanged
+          ? "media-binding-changed"
+          : "primary-video-changed",
         message: "",
         document: null,
         tracks: [],
@@ -1739,17 +1924,108 @@
     }
   }
 
+  function scriptMayContainCaptionData(script) {
+    const source = String(script?.text ?? "");
+    return /captionTracks|playerCaptionsTracklistRenderer|__INITIAL_STATE__|subtitle/i.test(
+      source,
+    );
+  }
+
+  function trackOrSourceBelongsToPrimaryVideo(node) {
+    const ownerVideo = node?.closest?.("video");
+    return Boolean(ownerVideo && isPotentialPrimaryVideo(ownerVideo));
+  }
+
+  function captionNodeIsRelevant(node) {
+    const tagName = String(node?.tagName ?? "").toLowerCase();
+    if (tagName === "script") return scriptMayContainCaptionData(node);
+    if (tagName === "video") return isPotentialPrimaryVideo(node);
+    if (tagName === "track" || tagName === "source") {
+      return trackOrSourceBelongsToPrimaryVideo(node);
+    }
+    return false;
+  }
+
   function containsCaptionNode(nodes) {
     return Array.from(nodes ?? []).some((node) => {
-      const tagName = String(node?.tagName ?? "").toLowerCase();
-      if (["script", "track", "video"].includes(tagName)) return true;
-      return Boolean(node?.querySelector?.("script, track, video"));
+      if (captionNodeIsRelevant(node)) return true;
+      const descendants = node?.querySelectorAll?.(
+        "script, video, track, video source",
+      );
+      return Array.from(descendants ?? []).some(captionNodeIsRelevant);
+    });
+  }
+
+  function youtubeCaptionMutationTarget(video) {
+    if (!youtubeVideoId()) return null;
+    return (
+      video?.closest?.("#movie_player") ??
+      document.querySelector?.("ytd-player #movie_player, #movie_player") ??
+      null
+    );
+  }
+
+  function observeYouTubeCaptionStructure(video) {
+    const target = youtubeCaptionMutationTarget(video);
+    if (target === observedCaptionMutationTarget) return;
+
+    mutationObserver?.disconnect();
+    observedCaptionMutationTarget = target;
+    if (!target) return;
+
+    mutationObserver?.observe(target, {
+      childList: true,
+      subtree: true,
+    });
+  }
+
+  function isCaptionAttributeMutation(mutation) {
+    if (mutation.type !== "attributes") return false;
+    const tagName = String(mutation.target?.tagName ?? "").toLowerCase();
+    if (tagName === "track") {
+      return (
+        trackOrSourceBelongsToPrimaryVideo(mutation.target) &&
+        ["kind", "label", "src", "srclang"].includes(
+          mutation.attributeName,
+        )
+      );
+    }
+    if (
+      (tagName === "video" || tagName === "source") &&
+      !trackOrSourceBelongsToPrimaryVideo(mutation.target)
+    ) {
+      return false;
+    }
+    return (
+      mutation.attributeName === "src" &&
+      (tagName === "video" || tagName === "source")
+    );
+  }
+
+  function observePrimaryVideoCaptionAttributes(video) {
+    if (video === observedCaptionVideo) return;
+    captionAttributeObserver?.disconnect();
+    captionAttributeObserver = null;
+    observedCaptionVideo = video ?? null;
+    if (!video) return;
+    captionAttributeObserver = new MutationObserver((mutations) => {
+      if (
+        isSupportedVideoPage() &&
+        Array.from(mutations ?? []).some(isCaptionAttributeMutation)
+      ) {
+        scheduleCaptionRefresh(250);
+      }
+    });
+    captionAttributeObserver.observe(video, {
+      attributes: true,
+      attributeFilter: ["kind", "label", "src", "srclang"],
+      subtree: true,
     });
   }
 
   mutationObserver = new MutationObserver((mutations) => {
+    if (!youtubeVideoId() || !isSupportedVideoPage()) return;
     const shouldRefresh = Array.from(mutations ?? []).some((mutation) => {
-      if (mutation.type === "attributes") return true;
       return (
         containsCaptionNode(mutation.addedNodes) ||
         containsCaptionNode(mutation.removedNodes)
@@ -1757,27 +2033,13 @@
     });
     if (shouldRefresh) scheduleCaptionRefresh(250);
   });
-  mutationObserver.observe(document.documentElement, {
-    attributes: true,
-    attributeFilter: ["kind", "label", "src", "srclang"],
-    childList: true,
-    subtree: true,
-  });
 
   intervalId = setInterval(publishState, PUBLISH_INTERVAL_MS);
-  retryIntervalId = setInterval(() => {
-    if (document.hidden) return;
-    if (
-      captionState.status === "loading" ||
-      captionState.status === "empty" ||
-      captionState.status === "unavailable"
-    ) {
-      scheduleCaptionRefresh();
-    }
-  }, TRACK_RETRY_INTERVAL_MS);
 
   const handleVisibilityChange = () => {
-    if (!document.hidden) scheduleCaptionRefresh(40);
+    if (document.hidden) return;
+    publishState();
+    if (isSupportedVideoPage()) scheduleCaptionRefresh(40);
   };
   document.addEventListener?.("visibilitychange", handleVisibilityChange);
 
@@ -1785,13 +2047,22 @@
     if (bridgeStopped) return;
     bridgeStopped = true;
     if (intervalId !== null) clearInterval(intervalId);
-    if (retryIntervalId !== null) clearInterval(retryIntervalId);
     if (refreshTimerId !== null) clearTimeout(refreshTimerId);
     for (const controller of manifestRequestControllers) controller.abort();
     manifestRequestControllers.clear();
     pageBridgeListeners.clear();
+    for (const { handler, target, type } of observedEventListeners.splice(0)) {
+      target.removeEventListener?.(type, handler);
+    }
     mutationObserver?.disconnect();
+    observedCaptionMutationTarget = null;
+    captionAttributeObserver?.disconnect();
+    captionAttributeObserver = null;
+    observedCaptionVideo = null;
     document.removeEventListener?.("visibilitychange", handleVisibilityChange);
+    chrome.runtime.onMessage.removeListener?.(handleRuntimeMessage);
+    removeEventListener("pageshow", handlePageShow);
+    removeEventListener("pagehide", handlePageHide);
     // Allow a freshly loaded extension build to install a new receiver in an
     // already-open video tab after the old extension context is invalidated.
     try {
@@ -1808,8 +2079,19 @@
     }
   }
 
-  addEventListener("pagehide", stopBridge, { once: true });
+  function handlePageShow(event) {
+    if (!event.persisted || bridgeStopped) return;
+    publishState();
+    if (isSupportedVideoPage()) scheduleCaptionRefresh(40);
+  }
+
+  function handlePageHide(event) {
+    if (!event.persisted) stopBridge();
+  }
+
+  addEventListener("pageshow", handlePageShow);
+  addEventListener("pagehide", handlePageHide);
 
   publishState();
-  void refreshCaptionsAutomatically();
+  if (isSupportedVideoPage()) void refreshCaptionsAutomatically();
 })();
