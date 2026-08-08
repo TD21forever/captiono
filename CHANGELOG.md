@@ -12,6 +12,7 @@ All notable Captiono changes are documented here.
 - 鼠标停留、文本选择、批注编辑、搜索或设置期间不会抢夺滚动位置。
 - 批注改为紧凑的原位编辑交互，支持点击外部关闭、回车保存，并在原文中显示精确选区标记与批注计数。
 - 增强重点短语、本地存储、完整字幕复制及研读笔记导出流程。
+- 更新 Captiono 产品图标，在小尺寸下更清晰地表达“选中字幕并添加批注”。
 - README 新增真实的批注工作流和“把学习内容交给任意 AI”产品场景。
 
 #### 稳定性与兼容性
@@ -30,6 +31,7 @@ All notable Captiono changes are documented here.
 - Pointer presence, text selection, annotation editing, search, and settings postpone automatic following.
 - Annotations now use a compact inline editor with outside-click dismissal, Enter-to-save, exact-range markers, and visible thread counts.
 - Improves useful-phrase highlighting, local persistence, full-transcript copy, and study-note exports.
+- Introduces a new Captiono icon that keeps the “select captions, then annotate” metaphor legible at small sizes.
 - Adds real annotation and bring-your-own-AI workflows to the bilingual README.
 
 #### Stability and compatibility

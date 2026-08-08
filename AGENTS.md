@@ -9,6 +9,7 @@ When implementing from a selected generated mock, treat that image as the source
 ## Selected Product Direction
 
 - The user-facing product name is `Captiono`, with the launcher line `从视频字幕里标记表达与笔记`. Keep existing `caption-review` DOM hooks, build artifacts, and storage keys for backward compatibility so upgrades preserve existing learner data.
+- Use `extension/icons/icon-source.png` as the extension icon source of truth: a full-bleed charcoal field, warm-white caption card, black caption lines, and a signal-red selected phrase connected to a red annotation bubble. Preserve the "select words, then annotate" metaphor, keep the mark legible at 16px, and do not reintroduce an outer white margin.
 - Use `design/editorial-study-notebook.png` as the visual source of truth.
 - The product should feel like a warm editorial learning notebook, not a clone of vCaptions' dark transcript list.
 - Present timestamps and full captions as one compact, continuous list so learners retain global context and can jump quickly; indicate the current sentence with a quiet active state instead of a large focus card.
