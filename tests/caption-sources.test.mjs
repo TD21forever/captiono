@@ -433,6 +433,110 @@ test("main-world bridge captures the signed request minted by the YouTube player
   assert.equal(subtitlesEnabled, true);
 });
 
+test("main-world bridge reads current player response tracks after YouTube SPA navigation", async () => {
+  const source = await readFile(
+    path.join(root, "extension/youtube-player-bridge.js"),
+    "utf8",
+  );
+  const videoId = "abcdefghijk";
+  const baseUrl =
+    `https://www.youtube.com/api/timedtext?v=${videoId}` +
+    "&lang=en&expire=9999999999&signature=current-player-response";
+  const responseTrack = {
+    baseUrl,
+    languageCode: "en",
+    name: { simpleText: "English" },
+    vssId: ".en",
+  };
+  const nonServableOptionTrack = {
+    languageCode: "en",
+    languageName: "English",
+    displayName: "English",
+    is_servable: false,
+    vss_id: ".en",
+  };
+  const setCalls = [];
+  const player = {
+    getVideoData() {
+      return { video_id: videoId };
+    },
+    getPlayerResponse() {
+      return {
+        videoDetails: { videoId },
+        captions: {
+          playerCaptionsTracklistRenderer: {
+            captionTracks: [responseTrack],
+          },
+        },
+      };
+    },
+    getOption(namespace, option) {
+      assert.equal(namespace, "captions");
+      if (option === "tracklist") return [nonServableOptionTrack];
+      if (option === "track") return null;
+      return null;
+    },
+    setOption(...args) {
+      setCalls.push(args);
+    },
+    isSubtitlesOn() {
+      return false;
+    },
+    toggleSubtitles() {},
+  };
+  const sandbox = {
+    URL,
+    clearTimeout,
+    document: {
+      getElementById(id) {
+        return id === "movie_player" ? player : null;
+      },
+    },
+    location: {
+      href: `https://www.youtube.com/watch?v=${videoId}`,
+      origin: "https://www.youtube.com",
+    },
+    performance: {
+      getEntriesByType() {
+        return [];
+      },
+      now() {
+        return 100;
+      },
+    },
+    setTimeout,
+  };
+  const context = vm.createContext(sandbox);
+  vm.runInContext(source.replace(/^export\s+/, ""), context, {
+    filename: "extension/youtube-player-bridge.js",
+  });
+  const capture = vm.runInContext("captureYouTubeCaptionUrl", context);
+
+  const discovery = await capture({ videoId, discoverOnly: true });
+  assert.equal(discovery.ok, true);
+  assert.equal(discovery.tracks.length, 1);
+  assert.equal(discovery.tracks[0].language, "en");
+  assert.equal(discovery.tracks[0].label, "English");
+  assert.equal(discovery.tracks[0].vssId, ".en");
+
+  const result = await capture({
+    videoId,
+    language: "en",
+    label: "English",
+    kind: "manual",
+    vssId: ".en",
+    forceFresh: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.captureMode, "player-response");
+  const capturedUrl = new URL(result.captionUrl);
+  assert.equal(capturedUrl.searchParams.get("v"), videoId);
+  assert.equal(capturedUrl.searchParams.get("lang"), "en");
+  assert.equal(capturedUrl.searchParams.get("fmt"), "json3");
+  assert.equal(setCalls.length, 0, "direct response tracks must not mutate the player");
+});
+
 test("page bridge returns real TextTrack cues bound to the current video", async () => {
   const source = await readFile(
     path.join(root, "extension/content-script.js"),

@@ -59,10 +59,10 @@ the external AI you choose.
 
 The Chrome Web Store listing is being prepared. For now, install the GitHub Release build:
 
-1. Download `captiono-1.6.2.zip` from [Releases](https://github.com/TD21forever/captiono/releases/latest).
+1. Download `captiono-1.6.3.zip` from [Releases](https://github.com/TD21forever/captiono/releases/latest).
 2. Unzip the archive.
 3. Open `chrome://extensions` and enable **Developer mode**.
-4. Click **Load unpacked** and select the extracted `captiono-1.6.2` folder.
+4. Click **Load unpacked** and select the extracted `captiono-1.6.3` folder.
 5. Open a captioned YouTube or Bilibili video.
 
 When updating an unpacked installation, reload Captiono on the Extensions page and then
@@ -103,7 +103,7 @@ npm run build:extension
 ```
 
 The unpacked build is written to `dist/extension`; the release archive is written to
-`dist/captiono-1.6.2.zip`.
+`dist/captiono-1.6.3.zip`.
 
 ## Verification
 

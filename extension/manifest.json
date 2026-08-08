@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Captiono",
-  "version": "1.6.2",
+  "version": "1.6.3",
   "description": "从 YouTube 和 Bilibili 视频里拾取表达、批注字幕并导出学习记录。",
   "minimum_chrome_version": "139",
   "incognito": "not_allowed",

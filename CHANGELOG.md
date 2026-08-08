@@ -2,6 +2,22 @@
 
 All notable Captiono changes are documented here.
 
+## v1.6.3 — YouTube current-player captions / YouTube 当前播放器字幕
+
+### 中文
+
+- 修复部分 YouTube 视频明明有字幕，Captiono 却显示“当前页面没有可用字幕”的问题。
+- YouTube 站内跳转后，优先读取当前播放器 `getPlayerResponse()` 返回的有效字幕轨，不再依赖可能过期的页面初始脚本。
+- 可直接使用播放器已经签发的字幕地址时，不再切换 YouTube 原生字幕状态，减少界面闪动与播放器干扰。
+- 新增针对 SPA 页面、不可服务的 `tracklist` 描述与当前播放器有效字幕并存场景的回归测试。
+
+### English
+
+- Fixes YouTube videos that expose valid captions while Captiono incorrectly reports that no captions are available.
+- After YouTube SPA navigation, prefers tracks from the current player's `getPlayerResponse()` instead of relying on potentially stale initial-page scripts.
+- Uses an already signed player caption URL without toggling YouTube's native caption state, reducing visual churn and player interference.
+- Adds regression coverage for current-player captions coexisting with non-servable `tracklist` descriptors.
+
 ## v1.6.2 — Dependency security update / 依赖安全更新
 
 ### 中文

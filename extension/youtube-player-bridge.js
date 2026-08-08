@@ -69,6 +69,17 @@ export async function captureYouTubeCaptionUrl(request) {
       .slice(0, MAX_TRACK_LANGUAGE_LENGTH);
   }
 
+  function trackLabel(track) {
+    return normalizeSpace(
+      track?.displayName ||
+        track?.languageName ||
+        track?.name?.simpleText ||
+        track?.name?.runs?.map((run) => run?.text ?? "").join("") ||
+        trackLanguage(track) ||
+        "Subtitles",
+    ).slice(0, MAX_TRACK_LABEL_LENGTH);
+  }
+
   function sameTrack(left, right) {
     const leftVssId = trackVssId(left);
     const rightVssId = trackVssId(right);
@@ -85,9 +96,7 @@ export async function captureYouTubeCaptionUrl(request) {
     const vssId = trackVssId(track);
     return {
       id: vssId || `youtube-player-${language || "und"}-${kind}-${index + 1}`,
-      label: normalizeSpace(
-        track?.displayName || track?.languageName || language || "Subtitles",
-      ).slice(0, MAX_TRACK_LABEL_LENGTH),
+      label: trackLabel(track),
       language,
       kind,
       vssId,
@@ -120,14 +129,37 @@ export async function captureYouTubeCaptionUrl(request) {
     };
   }
 
+  function playerResponseTracks(player) {
+    try {
+      const response = player.getPlayerResponse?.();
+      const responseVideoId = normalizeSpace(response?.videoDetails?.videoId);
+      if (responseVideoId && responseVideoId !== currentVideoId()) return [];
+      const tracks =
+        response?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      return Array.isArray(tracks) ? tracks : [];
+    } catch {
+      return [];
+    }
+  }
+
   function playerTracks(player) {
-    let tracks = [];
+    // The current player response is the authoritative source after YouTube
+    // SPA navigation. `captions.tracklist` can contain matching descriptors
+    // that are marked non-servable and omit the signed baseUrl entirely.
+    // Keep response tracks first so de-duplication preserves the usable URL.
+    let tracks = [...playerResponseTracks(player)];
+    let optionTracks = [];
     let current = null;
     try {
       const trackList = player.getOption("captions", "tracklist");
-      if (Array.isArray(trackList)) tracks = trackList;
+      if (Array.isArray(trackList)) optionTracks = trackList;
     } catch {
-      tracks = [];
+      optionTracks = [];
+    }
+    for (const track of optionTracks) {
+      if (!tracks.some((candidate) => sameTrack(candidate, track))) {
+        tracks.push(track);
+      }
     }
     try {
       current = player.getOption("captions", "track");
@@ -236,6 +268,16 @@ export async function captureYouTubeCaptionUrl(request) {
       if (url) return url;
     }
     return "";
+  }
+
+  function playerResponseCaptionUrl(videoId, track) {
+    try {
+      const url = new URL(track?.baseUrl, location.href);
+      url.searchParams.set("fmt", "json3");
+      return validCaptionUrl(url.href, videoId, track);
+    } catch {
+      return "";
+    }
   }
 
   function observeCaptionRequest(videoId, track, trigger, timeoutMs) {
@@ -473,6 +515,23 @@ export async function captureYouTubeCaptionUrl(request) {
       throw new Error("player-caption-track-unavailable");
     }
     const selected = publicTrack(selection.selected);
+
+    const responseUrl = playerResponseCaptionUrl(
+      videoId,
+      selection.selected,
+    );
+    if (responseUrl) {
+      return {
+        ok: true,
+        source: "youtube-player-caption",
+        videoId,
+        track: selected,
+        tracks: selection.tracks,
+        captionUrl: responseUrl,
+        captureMode: "player-response",
+        stateRestored: true,
+      };
+    }
 
     if (!request?.forceFresh) {
       const existing = recentCaptionUrl(videoId, selection.selected);
