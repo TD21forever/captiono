@@ -11,6 +11,7 @@ No browser interaction is required.
 4. Run:
 
    ```sh
+   npm run build
    npm run build:extension
    npm test
    ```
@@ -29,8 +30,8 @@ git push origin vX.Y.Z
 The `Release Captiono` workflow then:
 
 1. verifies that the tag, package version, and extension manifest version match;
-2. installs dependencies and runs the full test suite;
-3. builds a fresh extension ZIP and verifies its archived contents;
+2. installs dependencies and builds the Sites and extension release artifacts;
+3. runs the full test suite, including clean-build packaging checks;
 4. creates a SHA-256 checksum;
 5. publishes the GitHub Release with the ZIP, checksum, and prepared notes.
 

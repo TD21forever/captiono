@@ -37,8 +37,10 @@ jobs:
           test "$PACKAGE_VERSION" = "$MANIFEST_VERSION"
           test "$GITHUB_REF_NAME" = "v$PACKAGE_VERSION"
 
-      - name: Build verified extension archive
-        run: npm run build:extension
+      - name: Build verified release artifacts
+        run: |
+          npm run build
+          npm run build:extension
 
       - name: Run tests
         run: npm test
